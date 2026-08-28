@@ -1,17 +1,18 @@
 """
-lab_portal.py - Minimal read-only map + pose + odom portal for the QOD lab.
+lab_portal.py - Resilient live dashboard for the QOD lab Go2.
 
 Runs inside the robot_hivemind ROS 2 (Humble) container and subscribes to the
 lab's real topics (bridged from the Go2 over Zenoh / domain 70):
 
-    MAP   /lidar_slam_2d_map          (nav_msgs/msg/OccupancyGrid)
-    POSE  /go2/stabilized/current_pose (geometry_msgs/msg/PoseStamped)
-    ODOM  /go2/restamped/robot_odom   (nav_msgs/msg/Odometry)
+    MAP     /lidar_slam_2d_map            (nav_msgs/msg/OccupancyGrid)
+    POSE    /go2/stabilized/current_pose  (geometry_msgs/msg/PoseStamped)
+    ODOM    /go2/restamped/robot_odom     (nav_msgs/msg/Odometry)
+    CAMERA  /frontvideostream             (sensor_msgs/msg/Image)
+    BATTERY /lf/lowstate                  (unitree_go/msg/LowState)
 
-Click on the map to set a navigation goal (published to /goal_pose).
-
-This is intentionally standalone (no unitree_sdk2py, no cameras, no DDS
-clients) so it boots cleanly on topics that actually exist in this lab.
+The page ALWAYS loads. Every section shows a "Waiting for ..." placeholder
+until its topic starts publishing, so the robot being offline never crashes
+or blank-screens the dashboard. Click the map to set a nav goal (/goal_pose).
 
 Usage:
     source /opt/ros/humble/setup.bash
@@ -25,11 +26,6 @@ from collections import deque
 
 import cv2
 import numpy as np
-import rclpy
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
 
 import gradio as gr
 
@@ -37,36 +33,88 @@ import gradio as gr
 MAP_TOPIC = "/lidar_slam_2d_map"
 POSE_TOPIC = "/go2/stabilized/current_pose"
 ODOM_TOPIC = "/go2/restamped/robot_odom"
+CAMERA_TOPIC = "/frontvideostream"
+BATTERY_TOPIC = "/lf/lowstate"
 GOAL_TOPIC = "/goal_pose"
 FT_FRAME = "lidar_map"
 
 SERV_NAME = "0.0.0.0"
 SERV_PORT = 7860
 
+# ----------------------- import rclpy + msgs (defensive) -------------
+import rclpy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import OccupancyGrid, Odometry
+from sensor_msgs.msg import Image
+
+try:
+    from cv_bridge import CvBridge
+except Exception:  # pragma: no cover - cv_bridge usually present in Humble
+    CvBridge = None
+
+try:
+    from unitree_go.msg import LowState
+except Exception:
+    LowState = None
+
+
+def _placeholder(w, h, text, color=(56, 189, 248)):
+    """Dark placeholder image with centred text."""
+    ph = np.ones((h, w, 3), dtype=np.uint8) * 12
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, 0.6, 2)
+    cv2.putText(ph, text, ((w - tw) // 2, (h + th) // 2), font, 0.6, color, 2)
+    return ph
+
 
 class LabRobotNode(Node):
-    """Subscribes to map + pose + odom and renders a 2D map with the robot."""
+    """Subscribes to map/pose/odom/camera/battery and renders the dashboard."""
 
     def __init__(self):
         super().__init__("lab_portal_node")
+        # --- map ---
         self.map_info = None
         self.map = None
-        self.robot_pose = None
-        self.yaw = 0.0
-        self.odom_path = deque(maxlen=2000)
         self.cached_map_img = None
         self.cached_scale = None
         self.cached_meta = None
+        self.map_stamp = 0.0
+        # --- pose / odom ---
+        self.robot_pose = None
+        self.yaw = 0.0
+        self.odom_path = deque(maxlen=2000)
         self.pose_latest = "Waiting for pose..."
         self.last_goal = None
+        # --- camera ---
+        self.color_frame = None
+        self.cam_stamp = 0.0
+        self._bridge = CvBridge() if CvBridge else None
+        # --- battery / imu ---
+        self.battery = None
+        self.voltage = None
+        self.current = None
+        self.power = None
+        self.roll = None
+        self.pitch = None
+        self.imu_yaw = None
+        self.motor_status = None
+        self.bat_stamp = 0.0
+
         self._goal_queue = queue.Queue()
 
+        # All subscriptions are optional: ROS waits silently for any topic.
         self.create_subscription(OccupancyGrid, MAP_TOPIC, self.map_cb, 10)
         self.create_subscription(PoseStamped, POSE_TOPIC, self.pose_cb, 10)
         self.create_subscription(Odometry, ODOM_TOPIC, self.odom_cb, 10)
+        self.create_subscription(Image, CAMERA_TOPIC, self.camera_cb, 10)
+        if LowState is not None:
+            self.create_subscription(LowState, BATTERY_TOPIC, self.battery_cb, 10)
         self.goal_pub = self.create_publisher(PoseStamped, GOAL_TOPIC, 10)
         self.get_logger().info(
-            f"Subscribed to {MAP_TOPIC}, {POSE_TOPIC}, {ODOM_TOPIC}"
+            f"Subscribed to {MAP_TOPIC}, {POSE_TOPIC}, {ODOM_TOPIC}, "
+            f"{CAMERA_TOPIC}, {BATTERY_TOPIC}"
         )
 
         # Publish goals from a dedicated thread. rclpy publish() must NOT be
@@ -118,6 +166,7 @@ class LabRobotNode(Node):
         self.cached_map_img = out
         self.cached_scale = scale
         self.cached_meta = (origin_x, origin_y, h, ox, oy, res)
+        self.map_stamp = self.get_clock().now().nanoseconds / 1e9
 
     def pose_cb(self, msg):
         self.robot_pose = msg.pose
@@ -137,13 +186,34 @@ class LabRobotNode(Node):
             (msg.pose.pose.position.x, msg.pose.pose.position.y)
         )
 
+    def camera_cb(self, msg):
+        try:
+            if self._bridge is not None:
+                frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            else:  # manual fallback (BGR/8-bit only)
+                dtype = np.uint8
+                frame = np.frombuffer(msg.data, dtype=dtype)
+                frame = frame.reshape((msg.height, msg.width, 3))
+            self.color_frame = frame
+            self.cam_stamp = self.get_clock().now().nanoseconds / 1e9
+        except Exception as e:
+            self.get_logger().error(f"Camera conversion failed: {e}")
+
+    def battery_cb(self, msg):
+        self.battery = msg.bms_state.soc
+        self.motor_status = [m.temperature for m in msg.motor_state if m.mode == 1]
+        self.roll = msg.imu_state.rpy[0]
+        self.pitch = msg.imu_state.rpy[1]
+        self.imu_yaw = msg.imu_state.rpy[2]
+        self.voltage = msg.power_v
+        self.current = msg.power_a
+        self.power = self.voltage * self.current
+        self.bat_stamp = self.get_clock().now().nanoseconds / 1e9
+
     # ---------------------- rendering ----------------------
-    def draw(self):
+    def draw_map(self):
         if self.cached_map_img is None:
-            ph = np.ones((400, 400, 3), dtype=np.uint8) * 12
-            cv2.putText(ph, "WAITING FOR MAP...", (40, 200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (56, 189, 248), 2)
-            return ph
+            return _placeholder(640, 480, "WAITING FOR MAP...")
 
         canvas = self.cached_map_img.copy()
         scale = self.cached_scale
@@ -168,6 +238,77 @@ class LabRobotNode(Node):
             cv2.putText(canvas, "S", (wc // 2, hc - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (0, 0, 0), 2)
         return canvas
+
+    def draw_camera(self):
+        if self.color_frame is None:
+            return _placeholder(640, 360, "WAITING FOR CAMERA...")
+        frame = self.color_frame
+        h, w = frame.shape[:2]
+        if w > 640 or h > 360:
+            frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+        return frame
+
+    # ---------------------- text getters ----------------------
+    def get_battery_data(self):
+        if self.battery is None:
+            return "Waiting for battery status..."
+        if self.battery >= 70:
+            col = "🟢"
+        elif self.battery >= 30:
+            col = "🟡"
+        elif self.battery >= 20:
+            col = "🔴"
+        else:
+            col = "🚨"
+        text = f"🔋 {col} {self.battery} %"
+        if self.power is not None:
+            text += f"  🔌 {self.power:.1f} W ({self.voltage:.1f}V, {self.current:.1f}A)"
+        return text
+
+    def get_motor_data(self):
+        if self.motor_status is None:
+            return "Waiting for motor temps..."
+        legs = ["FL", "FR", "RL", "RR"]
+        out = []
+        for i, leg in enumerate(legs):
+            base = i * 3
+            out.append(
+                f"{leg} hip {self.motor_status[base]:.0f}°  "
+                f"thigh {self.motor_status[base+1]:.0f}°  "
+                f"calf {self.motor_status[base+2]:.0f}°"
+            )
+        return "\n".join(out)
+
+    def get_orientation_data(self):
+        if self.roll is None:
+            return "Waiting for IMU..."
+        text = (f"Roll {self.roll:.3f}   Pitch {self.pitch:.3f}   "
+                f"Yaw {self.imu_yaw:.3f} rad")
+        if abs(self.roll) > 0.5 or abs(self.pitch) > 0.5:
+            text += "\n🚨 Robot UNSTABLE!"
+        return text
+
+    def get_pose_data(self):
+        pos = self.pose_latest
+        if self.last_goal:
+            return (f"{pos}\n🎯 last goal: "
+                    f"({self.last_goal[0]:.2f}, {self.last_goal[1]:.2f})")
+        return pos
+
+    def get_connection_status(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        parts = []
+        for name, ts in (
+            ("MAP", self.map_stamp), ("CAM", self.cam_stamp),
+            ("BAT", self.bat_stamp),
+        ):
+            if ts > 0 and now - ts < 5.0:
+                parts.append(f"🟢 {name}")
+            elif ts > 0:
+                parts.append(f"🟡 {name} (stale)")
+            else:
+                parts.append(f"⚪ {name} (waiting)")
+        return "   ".join(parts)
 
     # ---------------------- goal click ----------------------
     def click_to_goal(self, evt: gr.SelectData):
@@ -203,25 +344,44 @@ def main():
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
 
-    with gr.Blocks(title="QOD Lab - Go2 Map Portal") as demo:
-        gr.Markdown("## 🗺️ Go2 Live Map (QOD Lab)")
-        map_img = gr.Image(label="Robot Map (click to set goal)", type="numpy")
-        goal_out = gr.Textbox(label="Goal Status")
-        pose_out = gr.Textbox(label="📍 Pose", lines=1)
+    with gr.Blocks(title="QOD Lab - Go2 Live Dashboard") as demo:
+        gr.Markdown("## 🗺️ Go2 Live Dashboard (QOD Lab)")
+        conn_out = gr.Textbox(label="Connection", lines=1, interactive=False)
 
-        def tick_map():
-            return node.draw()
+        with gr.Row():
+            with gr.Column(scale=3):
+                map_img = gr.Image(label="Robot Map (click to set goal)",
+                                   type="numpy")
+                goal_out = gr.Textbox(label="Goal Status", lines=1)
+            with gr.Column(scale=2):
+                cam_img = gr.Image(label="Camera", type="numpy")
 
-        def tick_pose():
-            pos = node.pose_latest
-            if node.last_goal:
-                return f"{pos}\n🎯 last goal: ({node.last_goal[0]:.2f}, {node.last_goal[1]:.2f})"
-            return pos
+        with gr.Row():
+            with gr.Column():
+                battery_out = gr.Textbox(label="🔋 Battery", lines=1)
+                motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=4)
+                orient_out = gr.Textbox(label="📐 Orientation", lines=2)
+            with gr.Column():
+                pose_out = gr.Textbox(label="📍 Pose", lines=2)
 
+        # --- tickers (each independently safe; missing data => placeholder) ---
         map_timer = gr.Timer(0.1)
-        map_timer.tick(tick_map, outputs=map_img)
-        pose_timer = gr.Timer(0.5)
-        pose_timer.tick(tick_pose, outputs=pose_out)
+        map_timer.tick(lambda: node.draw_map(), outputs=map_img)
+
+        cam_timer = gr.Timer(0.2)
+        cam_timer.tick(lambda: node.draw_camera(), outputs=cam_img)
+
+        status_timer = gr.Timer(1.0)
+        status_timer.tick(
+            lambda: (
+                node.get_connection_status(),
+                node.get_battery_data(),
+                node.get_motor_data(),
+                node.get_orientation_data(),
+                node.get_pose_data(),
+            ),
+            outputs=[conn_out, battery_out, motor_out, orient_out, pose_out],
+        )
 
         map_img.select(node.click_to_goal, None, [goal_out])
 
