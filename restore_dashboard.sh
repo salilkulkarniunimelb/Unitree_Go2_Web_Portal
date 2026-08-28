@@ -72,9 +72,9 @@ $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh start'"
 # --- 6) Tunnel + open browser --------------------------------------------------
 echo "[5/5] Opening SSH tunnel..."
 if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
-    setsid nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
+    nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
     disown || true
-    sleep 3
+    sleep 4
 fi
 
 echo ""
