@@ -31,12 +31,32 @@ import numpy as np
 import gradio as gr
 
 # ----------------------- Topic names (lab-real) -----------------------
-MAP_TOPIC = "/lidar_slam_2d_map"
-POSE_TOPIC = "/go2/stabilized/current_pose"
-ODOM_TOPIC = "/go2/restamped/robot_odom"
-CAMERA_TOPIC = "/frontvideostream"
-BATTERY_TOPIC = "/lf/lowstate"
-GOAL_TOPIC = "/goal_pose"
+# Luna topics (working reference for the lab).
+LUNA_TOPICS = {
+    "map":     "/lidar_slam_2d_map",
+    "pose":    "/go2/stabilized/current_pose",
+    "odom":    "/go2/restamped/robot_odom",
+    "camera":  "/frontvideostream",
+    "battery": "/lf/lowstate",
+    "goal":    "/goal_pose",
+}
+
+# Astro topics. For now these match Luna's; update this dict if Astro
+# publishes under different names (e.g. an /astro/ prefix) later.
+ASTRO_TOPICS = {
+    "map":     "/lidar_slam_2d_map",
+    "pose":    "/go2/stabilized/current_pose",
+    "odom":    "/go2/restamped/robot_odom",
+    "camera":  "/frontvideostream",
+    "battery": "/lf/lowstate",
+    "goal":    "/goal_pose",
+}
+
+ROBOTS = {
+    "Luna": LUNA_TOPICS,
+    "Astro": ASTRO_TOPICS,
+}
+
 FT_FRAME = "lidar_map"
 
 SERV_NAME = "0.0.0.0"
@@ -93,14 +113,24 @@ DASHBOARD_CSS = """
         box-shadow:0 2px 8px rgba(0,0,0,.35);}
     .portal-header .title{font-size:20px;font-weight:700;letter-spacing:.3px;}
     .portal-header .subtitle{font-size:13px;opacity:.85;margin-top:2px;}
+    .robot-selector{margin-top:10px;}
 """
 
 
-class LabRobotNode(Node):
-    """Subscribes to map/pose/odom/camera/battery and renders the dashboard."""
+class RobotState:
+    """Per-robot data + callbacks + rendering.
 
-    def __init__(self):
-        super().__init__("lab_portal_node")
+    One instance per robot (Luna, Astro). Each owns its own topic names and
+    live data, so the dashboard can switch between robots without ever
+    tearing down or recreating subscriptions.
+    """
+
+    def __init__(self, node, name, topics):
+        self.node = node
+        self.name = name
+        self.topics = topics
+        self._bridge = CvBridge() if CvBridge else None
+
         # --- map ---
         self.map_info = None
         self.map = None
@@ -117,7 +147,6 @@ class LabRobotNode(Node):
         # --- camera ---
         self.color_frame = None
         self.cam_stamp = 0.0
-        self._bridge = CvBridge() if CvBridge else None
         # --- battery / imu ---
         self.battery = None
         self.voltage = None
@@ -130,39 +159,6 @@ class LabRobotNode(Node):
         self.bat_stamp = 0.0
 
         self._goal_queue = queue.Queue()
-
-        # All subscriptions are optional: ROS waits silently for any topic.
-        self.create_subscription(OccupancyGrid, MAP_TOPIC, self.map_cb, 10)
-        self.create_subscription(PoseStamped, POSE_TOPIC, self.pose_cb, 10)
-        self.create_subscription(Odometry, ODOM_TOPIC, self.odom_cb, 10)
-        self.create_subscription(Image, CAMERA_TOPIC, self.camera_cb, 10)
-        if LowState is not None:
-            self.create_subscription(LowState, BATTERY_TOPIC, self.battery_cb, 10)
-        self.goal_pub = self.create_publisher(PoseStamped, GOAL_TOPIC, 10)
-        self.get_logger().info(
-            f"Subscribed to {MAP_TOPIC}, {POSE_TOPIC}, {ODOM_TOPIC}, "
-            f"{CAMERA_TOPIC}, {BATTERY_TOPIC}"
-        )
-
-        # Publish goals from a dedicated thread. rclpy publish() must NOT be
-        # called from a Gradio/anyio worker thread (it can corrupt the rclpy
-        # context and crash the whole process).
-        threading.Thread(target=self._goal_publish_loop, daemon=True).start()
-
-    def _goal_publish_loop(self):
-        while True:
-            try:
-                goal = self._goal_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                self.goal_pub.publish(goal)
-                self.get_logger().info(
-                    f"Goal published -> "
-                    f"({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f})"
-                )
-            except Exception as e:
-                self.get_logger().error(f"Failed to publish goal: {e}")
 
     # ---------------------- callbacks ----------------------
     def map_cb(self, msg):
@@ -193,7 +189,7 @@ class LabRobotNode(Node):
         self.cached_map_img = out
         self.cached_scale = scale
         self.cached_meta = (origin_x, origin_y, h, ox, oy, res)
-        self.map_stamp = self.get_clock().now().nanoseconds / 1e9
+        self.map_stamp = self.node.get_clock().now().nanoseconds / 1e9
 
     def pose_cb(self, msg):
         self.robot_pose = msg.pose
@@ -222,9 +218,9 @@ class LabRobotNode(Node):
                 frame = np.frombuffer(msg.data, dtype=dtype)
                 frame = frame.reshape((msg.height, msg.width, 3))
             self.color_frame = frame
-            self.cam_stamp = self.get_clock().now().nanoseconds / 1e9
+            self.cam_stamp = self.node.get_clock().now().nanoseconds / 1e9
         except Exception as e:
-            self.get_logger().error(f"Camera conversion failed: {e}")
+            self.node.get_logger().error(f"Camera conversion failed: {e}")
 
     def battery_cb(self, msg):
         self.battery = msg.bms_state.soc
@@ -235,12 +231,12 @@ class LabRobotNode(Node):
         self.voltage = msg.power_v
         self.current = msg.power_a
         self.power = self.voltage * self.current
-        self.bat_stamp = self.get_clock().now().nanoseconds / 1e9
+        self.bat_stamp = self.node.get_clock().now().nanoseconds / 1e9
 
     # ---------------------- rendering ----------------------
     def draw_map(self):
         if self.cached_map_img is None:
-            return _placeholder(640, 480, "WAITING FOR MAP...")
+            return _placeholder(640, 480, f"WAITING FOR {self.name.upper()} MAP...")
 
         canvas = self.cached_map_img.copy()
         scale = self.cached_scale
@@ -268,7 +264,7 @@ class LabRobotNode(Node):
 
     def draw_camera(self):
         if self.color_frame is None:
-            return _placeholder(640, 360, "WAITING FOR CAMERA...")
+            return _placeholder(640, 360, f"WAITING FOR {self.name.upper()} CAMERA...")
         frame = self.color_frame
         h, w = frame.shape[:2]
         if w > 640 or h > 360:
@@ -278,7 +274,7 @@ class LabRobotNode(Node):
     # ---------------------- text getters ----------------------
     def get_battery_data(self):
         if self.battery is None:
-            return "Waiting for battery status..."
+            return f"Waiting for {self.name} battery..."
         if self.battery >= 70:
             col = "🟢"
         elif self.battery >= 30:
@@ -294,7 +290,7 @@ class LabRobotNode(Node):
 
     def get_motor_data(self):
         if self.motor_status is None:
-            return "Waiting for motor temps..."
+            return f"Waiting for {self.name} motor temps..."
         legs = ["FL", "FR", "RL", "RR"]
         out = []
         for i, leg in enumerate(legs):
@@ -308,7 +304,7 @@ class LabRobotNode(Node):
 
     def get_orientation_data(self):
         if self.roll is None:
-            return "Waiting for IMU..."
+            return f"Waiting for {self.name} IMU..."
         text = (f"Roll {self.roll:.3f}   Pitch {self.pitch:.3f}   "
                 f"Yaw {self.imu_yaw:.3f} rad")
         if abs(self.roll) > 0.5 or abs(self.pitch) > 0.5:
@@ -323,7 +319,7 @@ class LabRobotNode(Node):
         return pos
 
     def get_connection_status(self):
-        now = self.get_clock().now().nanoseconds / 1e9
+        now = self.node.get_clock().now().nanoseconds / 1e9
         parts = []
         for name, ts in (
             ("MAP", self.map_stamp), ("CAM", self.cam_stamp),
@@ -340,7 +336,7 @@ class LabRobotNode(Node):
     # ---------------------- goal click ----------------------
     def click_to_goal(self, evt: gr.SelectData):
         if self.cached_meta is None:
-            return "No map yet"
+            return f"No {self.name} map yet"
         origin_x, origin_y, h, ox, oy, res = self.cached_meta
         idx = evt.index
         row, col = idx[0], idx[1]
@@ -355,13 +351,98 @@ class LabRobotNode(Node):
         wy = (h - 1 - myp) * res + origin_y
         goal = PoseStamped()
         goal.header.frame_id = FT_FRAME
-        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.header.stamp = self.node.get_clock().now().to_msg()
         goal.pose.position.x = float(wx)
         goal.pose.position.y = float(wy)
         goal.pose.orientation.w = 1.0
         self._goal_queue.put(goal)
         self.last_goal = (wx, wy)
-        return f"Goal set -> ({wx:.3f}, {wy:.3f})"
+        return f"{self.name}: Goal set -> ({wx:.3f}, {wy:.3f})"
+
+
+class LabRobotNode(Node):
+    """Subscribes to map/pose/odom/camera/battery for every robot and exposes
+    the currently-selected robot for rendering."""
+
+    def __init__(self):
+        super().__init__("lab_portal_node")
+        self.robots = {}
+        for name, topics in ROBOTS.items():
+            robot = RobotState(self, name, topics)
+
+            # All subscriptions are optional: ROS waits silently for any topic.
+            self.create_subscription(OccupancyGrid, topics["map"], robot.map_cb, 10)
+            self.create_subscription(PoseStamped, topics["pose"], robot.pose_cb, 10)
+            self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
+            self.create_subscription(Image, topics["camera"], robot.camera_cb, 10)
+            if LowState is not None:
+                self.create_subscription(LowState, topics["battery"], robot.battery_cb, 10)
+
+            robot.goal_pub = self.create_publisher(PoseStamped, topics["goal"], 10)
+            self.robots[name] = robot
+            self.get_logger().info(
+                f"[{name}] Subscribed to {topics['map']}, {topics['pose']}, "
+                f"{topics['odom']}, {topics['camera']}, {topics['battery']}"
+            )
+
+        self.current = "Luna"
+
+        # Publish goals from a dedicated thread. rclpy publish() must NOT be
+        # called from a Gradio/anyio worker thread (it can corrupt the rclpy
+        # context and crash the whole process).
+        threading.Thread(target=self._goal_publish_loop, daemon=True).start()
+
+    def _goal_publish_loop(self):
+        while True:
+            for name, robot in self.robots.items():
+                try:
+                    goal = robot._goal_queue.get(timeout=0.0)
+                except queue.Empty:
+                    continue
+                try:
+                    robot.goal_pub.publish(goal)
+                    self.get_logger().info(
+                        f"[{name}] Goal published -> "
+                        f"({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f})"
+                    )
+                except Exception as e:
+                    self.get_logger().error(f"[{name}] Failed to publish goal: {e}")
+            threading.Event().wait(0.1)
+
+    # ---- the active robot's data ----
+    @property
+    def current_robot(self):
+        return self.robots[self.current]
+
+    def set_robot(self, name):
+        if name in self.robots:
+            self.current = name
+            return f"Showing: {name}"
+        return f"Unknown robot: {name}"
+
+    def draw_map(self):
+        return self.current_robot.draw_map()
+
+    def draw_camera(self):
+        return self.current_robot.draw_camera()
+
+    def get_battery_data(self):
+        return self.current_robot.get_battery_data()
+
+    def get_motor_data(self):
+        return self.current_robot.get_motor_data()
+
+    def get_orientation_data(self):
+        return self.current_robot.get_orientation_data()
+
+    def get_pose_data(self):
+        return self.current_robot.get_pose_data()
+
+    def get_connection_status(self):
+        return self.current_robot.get_connection_status()
+
+    def click_to_goal(self, evt: gr.SelectData):
+        return self.current_robot.click_to_goal(evt)
 
 
 def main():
@@ -393,7 +474,15 @@ def main():
 
     with gr.Blocks(title="QOD Lab - Go2 Live Dashboard") as demo:
         gr.HTML(header_html)
-        conn_out = gr.Textbox(label="Connection", lines=1, interactive=False)
+        with gr.Row():
+            robot_dd = gr.Dropdown(
+                choices=list(ROBOTS.keys()),
+                value=node.current,
+                label="🤖 Select Robot",
+                interactive=True,
+                elem_classes=["robot-selector"],
+            )
+            conn_out = gr.Textbox(label="Connection", lines=1, interactive=False, scale=3)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -431,6 +520,8 @@ def main():
         )
 
         map_img.select(node.click_to_goal, None, [goal_out])
+
+        robot_dd.change(node.set_robot, robot_dd, None)
 
     demo.launch(
         server_name=SERV_NAME,
