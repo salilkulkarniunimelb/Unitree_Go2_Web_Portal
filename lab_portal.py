@@ -22,6 +22,7 @@ Usage:
 import math
 import queue
 import threading
+import time
 import base64
 from collections import deque
 
@@ -31,31 +32,37 @@ import numpy as np
 import gradio as gr
 
 # ----------------------- Topic names (lab-real) -----------------------
-# Luna topics (working reference for the lab).
+# Topics actually publishing on the lab server (verified via ros2 topic list).
+# Each robot publishes under its own namespace (/luna/, /astro/).
+# - Map and camera are the live streams.
+# - Pose is shared on the unprefixed /go2/stabilized/current_pose topic.
+# - No battery topic exists for either robot yet.
 LUNA_TOPICS = {
-    "map":     "/lidar_slam_2d_map",
+    "map":     "/luna/lidar_slam_2d_map",
     "pose":    "/go2/stabilized/current_pose",
-    "odom":    "/go2/restamped/robot_odom",
-    "camera":  "/frontvideostream",
+    "odom":    "/luna/go2/restamped/robot_odom",
+    "camera":  "/luna/frontvideostream",
     "battery": "/lf/lowstate",
-    "goal":    "/goal_pose",
+    "goal":    "/luna/goal_pose",
 }
 
-# Astro topics. For now these match Luna's; update this dict if Astro
-# publishes under different names (e.g. an /astro/ prefix) later.
 ASTRO_TOPICS = {
-    "map":     "/lidar_slam_2d_map",
+    "map":     "/astro/lidar_slam_2d_map",
     "pose":    "/go2/stabilized/current_pose",
-    "odom":    "/go2/restamped/robot_odom",
-    "camera":  "/frontvideostream",
+    "odom":    "/astro/go2/restamped/robot_odom",
+    "camera":  "/astro/frontvideostream",
     "battery": "/lf/lowstate",
-    "goal":    "/goal_pose",
+    "goal":    "/astro/goal_pose",
 }
 
 ROBOTS = {
     "Luna": LUNA_TOPICS,
     "Astro": ASTRO_TOPICS,
 }
+
+# Luna's camera is H.264-encoded Go2FrontVideoData. cv2.VideoCapture (FFmpeg
+# backend) decodes it from a rolling buffer written to a temp file.
+CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
 
 FT_FRAME = "lidar_map"
 
@@ -79,6 +86,11 @@ try:
     from unitree_go.msg import LowState
 except Exception:
     LowState = None
+
+try:
+    from unitree_go.msg import Go2FrontVideoData
+except Exception:
+    Go2FrontVideoData = None
 
 
 def _placeholder(w, h, text, color=(56, 189, 248)):
@@ -105,6 +117,9 @@ def logo_data_uri(path="assets/logo.png"):
 
 
 DASHBOARD_CSS = """
+    html, body, .gradio-container, .gradio-container * {
+        font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif !important;
+    }
     .portal-header{display:flex;align-items:center;gap:14px;
         padding:10px 12px;border-radius:12px;
         background:linear-gradient(90deg,#0f2450,#000f46);
@@ -147,6 +162,9 @@ class RobotState:
         # --- camera ---
         self.color_frame = None
         self.cam_stamp = 0.0
+        self._cam_buf = bytearray()
+        self._cam_lock = threading.Lock()
+        self._last_decode = 0.0
         # --- battery / imu ---
         self.battery = None
         self.voltage = None
@@ -205,22 +223,73 @@ class RobotState:
         )
 
     def odom_cb(self, msg):
+        p = msg.pose.pose
         self.odom_path.append(
-            (msg.pose.pose.position.x, msg.pose.pose.position.y)
+            (p.position.x, p.position.y)
         )
+        # The dedicated pose topic (/go2/stabilized/current_pose) has no
+        # publisher on this server, so derive pose from odometry instead.
+        q = p.orientation
+        try:
+            self.robot_pose = p
+            self.yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            )
+            self.pose_latest = (
+                f"x: {p.position.x:.3f}   "
+                f"y: {p.position.y:.3f}   "
+                f"yaw: {self.yaw:.3f} rad"
+            )
+        except Exception:
+            pass
 
     def camera_cb(self, msg):
+        """Append H.264 bytes from Go2FrontVideoData to the rolling buffer."""
         try:
-            if self._bridge is not None:
-                frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            else:  # manual fallback (BGR/8-bit only)
-                dtype = np.uint8
-                frame = np.frombuffer(msg.data, dtype=dtype)
-                frame = frame.reshape((msg.height, msg.width, 3))
-            self.color_frame = frame
+            data = bytes(msg.data)
+            with self._cam_lock:
+                self._cam_buf.extend(data)
+                # keep a bounded trailing window (enough for a full IDR+frames)
+                if len(self._cam_buf) > CAM_BUFFER_MAX:
+                    del self._cam_buf[: len(self._cam_buf) - CAM_BUFFER_MAX]
             self.cam_stamp = self.node.get_clock().now().nanoseconds / 1e9
         except Exception as e:
-            self.node.get_logger().error(f"Camera conversion failed: {e}")
+            self.node.get_logger().error(f"Camera buffer failed: {e}")
+
+    def decode_camera(self):
+        """Decode the latest H.264 window into a frame (rate-limited ~2Hz)."""
+        if not self._cam_buf:
+            return None
+        now = time.time()
+        if now - self._last_decode < 0.4:
+            return self.color_frame
+        self._last_decode = now
+        try:
+            with self._cam_lock:
+                raw = bytes(self._cam_buf[-CAM_BUFFER_MAX:])
+            if not raw:
+                return None
+            tmp = f"/tmp/{self.name}_cam.h264"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            cap = cv2.VideoCapture(tmp)
+            frame = None
+            for _ in range(600):
+                ret, f = cap.read()
+                if not ret:
+                    break
+                frame = f
+            cap.release()
+            if frame is not None:
+                h, w = frame.shape[:2]
+                if w > CAM_W or h > CAM_H:
+                    frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+                self.color_frame = frame
+            return frame
+        except Exception as e:
+            self.node.get_logger().error(f"Camera decode failed: {e}")
+            return None
 
     def battery_cb(self, msg):
         self.battery = msg.bms_state.soc
@@ -263,6 +332,7 @@ class RobotState:
         return canvas
 
     def draw_camera(self):
+        self.decode_camera()
         if self.color_frame is None:
             return _placeholder(640, 360, f"WAITING FOR {self.name.upper()} CAMERA...")
         frame = self.color_frame
@@ -374,7 +444,10 @@ class LabRobotNode(Node):
             self.create_subscription(OccupancyGrid, topics["map"], robot.map_cb, 10)
             self.create_subscription(PoseStamped, topics["pose"], robot.pose_cb, 10)
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
-            self.create_subscription(Image, topics["camera"], robot.camera_cb, 10)
+            if Go2FrontVideoData is not None:
+                self.create_subscription(
+                    Go2FrontVideoData, topics["camera"], robot.camera_cb, 10
+                )
             if LowState is not None:
                 self.create_subscription(LowState, topics["battery"], robot.battery_cb, 10)
 
@@ -456,6 +529,7 @@ def main():
         primary_hue=gr.themes.colors.blue,
         secondary_hue=gr.themes.colors.blue,
         neutral_hue=gr.themes.colors.slate,
+        font="Helvetica, 'Helvetica Neue', Arial, sans-serif",
     ).set(
         body_background_fill="#f4f6fb",
         block_background_fill="#ffffff",

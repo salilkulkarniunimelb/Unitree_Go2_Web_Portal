@@ -45,6 +45,11 @@ start() {
         return 1
     fi
     source /opt/ros/humble/setup.bash
+    # Also source the hardware ROS2 workspace (provides unitree_go msg types)
+    # used for the H.264 front-camera stream. Optional if not present.
+    if [ -f /workspace/hardware_code/ros2_ws/install/setup.bash ]; then
+        source /workspace/hardware_code/ros2_ws/install/setup.bash
+    fi
     setsid nohup python3 lab_portal.py > "$LOGFILE" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     echo "Started pid $(cat "$PIDFILE"). Waiting for it to serve..."
