@@ -22,6 +22,7 @@ Usage:
 import math
 import queue
 import threading
+import base64
 from collections import deque
 
 import cv2
@@ -67,6 +68,32 @@ def _placeholder(w, h, text, color=(56, 189, 248)):
     (tw, th), _ = cv2.getTextSize(text, font, 0.6, 2)
     cv2.putText(ph, text, ((w - tw) // 2, (h + th) // 2), font, 0.6, color, 2)
     return ph
+
+
+_LOGO_URI = None
+
+
+def logo_data_uri(path="assets/logo.png"):
+    """Return the logo as a base64 data URI so it renders regardless of how
+    Gradio serves static files (works over SSH tunnels / containers)."""
+    global _LOGO_URI
+    if _LOGO_URI is None:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        _LOGO_URI = f"data:image/png;base64,{b64}"
+    return _LOGO_URI
+
+
+DASHBOARD_CSS = """
+    .portal-header{display:flex;align-items:center;gap:14px;
+        padding:10px 12px;border-radius:12px;
+        background:linear-gradient(90deg,#0f2450,#000f46);
+        color:#fff;margin-bottom:4px;}
+    .portal-header img.logo{height:44px;width:auto;border-radius:8px;
+        box-shadow:0 2px 8px rgba(0,0,0,.35);}
+    .portal-header .title{font-size:20px;font-weight:700;letter-spacing:.3px;}
+    .portal-header .subtitle{font-size:13px;opacity:.85;margin-top:2px;}
+"""
 
 
 class LabRobotNode(Node):
@@ -344,8 +371,28 @@ def main():
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
 
+    theme = gr.themes.Soft(
+        primary_hue=gr.themes.colors.blue,
+        secondary_hue=gr.themes.colors.blue,
+        neutral_hue=gr.themes.colors.slate,
+    ).set(
+        body_background_fill="#f4f6fb",
+        block_background_fill="#ffffff",
+        block_border_color="#e3e8f2",
+    )
+
+    header_html = f"""
+    <div class="portal-header">
+        <img class="logo" src="{logo_data_uri()}" alt="logo"/>
+        <div>
+            <div class="title">QOD Lab · Go2 Live Dashboard</div>
+            <div class="subtitle">Map · Camera · Battery · Pose — live from the lab</div>
+        </div>
+    </div>
+    """
+
     with gr.Blocks(title="QOD Lab - Go2 Live Dashboard") as demo:
-        gr.Markdown("## 🗺️ Go2 Live Dashboard (QOD Lab)")
+        gr.HTML(header_html)
         conn_out = gr.Textbox(label="Connection", lines=1, interactive=False)
 
         with gr.Row():
@@ -385,7 +432,12 @@ def main():
 
         map_img.select(node.click_to_goal, None, [goal_out])
 
-    demo.launch(server_name=SERV_NAME, server_port=SERV_PORT)
+    demo.launch(
+        server_name=SERV_NAME,
+        server_port=SERV_PORT,
+        theme=theme,
+        css=DASHBOARD_CSS,
+    )
 
 
 if __name__ == "__main__":
