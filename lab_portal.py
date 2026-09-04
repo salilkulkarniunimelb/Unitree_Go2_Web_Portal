@@ -19,8 +19,12 @@ Usage:
     python3 lab_portal.py            # serves on 0.0.0.0:7860
 """
 
+import errno
 import math
+import os
 import queue
+import select
+import subprocess
 import threading
 import time
 import base64
@@ -60,12 +64,16 @@ ROBOTS = {
     "Astro": ASTRO_TOPICS,
 }
 
-# Luna's camera is H.264-encoded Go2FrontVideoData. cv2.VideoCapture (FFmpeg
-# backend) decodes it from a rolling buffer written to a temp file.
+# Luna's camera is H.264-encoded Go2FrontVideoData. We decode it with a
+# persistent ffmpeg pipeline (started once per robot) fed via stdin and read
+# decoded BGR frames from stdout — no repeated file-open, so it is smooth and
+# cheap. ffmpeg must be installed in the container (see restore_dashboard.sh).
 CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
-# Decode only the newest slice (still spans many keyframes at ~85fps) — scanning
-# and re-opening the whole 6MB buffer every tick is what pegged the CPU.
+# Decode only the newest slice for the file-based fallback decode.
 CAM_DECODE_WINDOW = 1 * 1024 * 1024
+# If the ffmpeg pipe delivers no frame for this long (s), fall back to the
+# slower file-based decode so the camera never fully blanks.
+CAM_PIPE_FALLBACK = 4.0
 
 FT_FRAME = "lidar_map"
 
@@ -170,11 +178,17 @@ class RobotState:
         # --- camera ---
         self.color_frame = None
         self.cam_stamp = 0.0
+        self.cam_frame_ts = 0.0
         self._cam_buf = bytearray()
         self._cam_lock = threading.Lock()
         self._last_decode = 0.0
-        # Decode runs on its OWN thread so the heavy H.264 decode never blocks
-        # the Gradio event-loop / status tickers.
+        self._ffmpeg = None
+        self._ffmpeg_lock = threading.Lock()
+        self._stop_cam = False
+        # Primary decode: continuous ffmpeg pipe (smooth, low CPU). The
+        # file-based decode stays as a rarely-used fallback thread below.
+        self._start_ffmpeg_pipeline()
+        threading.Thread(target=self._ffmpeg_reader, daemon=True).start()
         threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
         self.battery = None
@@ -256,7 +270,8 @@ class RobotState:
             pass
 
     def camera_cb(self, msg):
-        """Append H.264 bytes from Go2FrontVideoData to the rolling buffer."""
+        """Append H.264 bytes from Go2FrontVideoData to the rolling buffer and
+        feed them into the persistent ffmpeg decode pipeline."""
         try:
             data = bytes(msg.data)
             with self._cam_lock:
@@ -264,9 +279,96 @@ class RobotState:
                 # keep a bounded trailing window (enough for a full IDR+frames)
                 if len(self._cam_buf) > CAM_BUFFER_MAX:
                     del self._cam_buf[: len(self._cam_buf) - CAM_BUFFER_MAX]
+            self._pipe_feed(data)
             self.cam_stamp = self.node.get_clock().now().nanoseconds / 1e9
         except Exception as e:
             self.node.get_logger().error(f"Camera buffer failed: {e}")
+
+    # ------------------ persistent ffmpeg pipeline ------------------
+    def _start_ffmpeg_pipeline(self):
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-probesize", "1024", "-analyzeduration", "0",
+            "-f", "h264", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-flush_packets", "1",
+            "pipe:1",
+        ]
+        with self._ffmpeg_lock:
+            try:
+                self._ffmpeg = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                os.set_blocking(self._ffmpeg.stdout.fileno(), False)
+                try:
+                    os.set_blocking(self._ffmpeg.stdin.fileno(), False)
+                except OSError:
+                    pass
+            except Exception as e:
+                self._ffmpeg = None
+                self.node.get_logger().warn(f"[{self.name}] ffmpeg start failed: {e}")
+
+    def _pipe_feed(self, data):
+        """Non-blocking write of H.264 bytes into ffmpeg stdin (drop if full)."""
+        p = self._ffmpeg
+        if p is None or p.stdin is None:
+            return
+        try:
+            os.write(p.stdin.fileno(), data)
+        except (BlockingIOError, BrokenPipeError, OSError) as e:
+            if isinstance(e, BlockingIOError):
+                return  # decoder is behind live pace; drop stale bytes
+            self._restart_ffmpeg()
+
+    def _restart_ffmpeg(self):
+        with self._ffmpeg_lock:
+            old = self._ffmpeg
+            self._ffmpeg = None
+            if old is not None:
+                try:
+                    old.terminate()
+                except Exception:
+                    pass
+        self._start_ffmpeg_pipeline()
+        self.node.get_logger().info(f"[{self.name}] restarting ffmpeg pipeline")
+
+    def _ffmpeg_reader(self):
+        """Continuously read decoded BGR frames from ffmpeg stdout and publish
+        them into self.color_frame."""
+        size = CAM_W * CAM_H * 3
+        buf = b""
+        while not self._stop_cam:
+            p = self._ffmpeg
+            if p is None or p.stdout is None:
+                if self._ffmpeg is None:
+                    self._restart_ffmpeg()
+                threading.Event().wait(0.5)
+                continue
+            try:
+                r, _, _ = select.select([p.stdout], [], [], 0.2)
+                if not r:
+                    continue
+                d = os.read(p.stdout.fileno(), 65536)
+                if not d:
+                    self._restart_ffmpeg()
+                    buf = b""
+                    continue
+                buf += d
+                while len(buf) >= size:
+                    frame = np.frombuffer(buf[:size], dtype=np.uint8).copy()
+                    frame = frame.reshape((CAM_H, CAM_W, 3))
+                    buf = buf[size:]
+                    self.color_frame = frame
+                    self.cam_frame_ts = time.time()
+            except (BrokenPipeError, OSError):
+                self._restart_ffmpeg()
+                buf = b""
+                continue
+            except Exception:
+                buf = b""
+                continue
 
     @staticmethod
     def _trim_to_keyframe(raw):
@@ -308,16 +410,23 @@ class RobotState:
         return raw[codes[0][0]:]
 
     def _camera_decode_loop(self):
-        """Dedicated thread: trim to keyframe, decode newest window, update
-        self.color_frame. Runs off the Gradio thread so it never stalls the UI."""
-        while True:
+        """Low-frequency fallback decode thread.
+
+        The primary source is the continuous ffmpeg pipe. This thread only
+        kicks in (file-based decode ~4s apart) if the pipe has delivered no
+        frame recently, so the camera never fully blanks if ffmpeg struggles."""
+        while not self._stop_cam:
+            if self.cam_frame_ts and time.time() - self.cam_frame_ts < CAM_PIPE_FALLBACK:
+                threading.Event().wait(2.0)
+                continue
             try:
                 frame = self._decode_camera_once()
                 if frame is not None:
                     self.color_frame = frame
+                    self.cam_frame_ts = time.time()
             except Exception as e:
                 self.node.get_logger().error(f"Camera decode failed: {e}")
-            threading.Event().wait(2.0)
+            threading.Event().wait(4.0)
 
     def _decode_camera_once(self):
         """Decode the newest H.264 window into a frame (returns numpy or None)."""

@@ -84,13 +84,24 @@ $SSH "docker exec $CONTAINER bash -lc '
     fi
 '"
 
-# --- 5) Start the portal ------------------------------------------------------
-echo "[4/5] Starting the portal..."
+# --- 5) Ensure ffmpeg (for the live H.264 camera pipeline) -----------------
+echo "[4/5] Ensuring ffmpeg (installs only if missing)..."
+$SSH "docker exec $CONTAINER bash -lc '
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo \"  -> installing ffmpeg...\"
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ffmpeg
+    else
+        echo ffmpeg-ok
+    fi
+'"
+
+# --- 6) Start the portal ------------------------------------------------------
+echo "[5/6] Starting the portal..."
 $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh stop || true'"
 $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh start'"
 
-# --- 6) Tunnel + open browser --------------------------------------------------
-echo "[5/5] Opening SSH tunnel..."
+# --- 7) Tunnel + open browser --------------------------------------------------
+echo "[6/6] Opening SSH tunnel..."
 if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
     nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
     disown || true
