@@ -82,7 +82,7 @@ SERV_PORT = 7860
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image
@@ -534,8 +534,19 @@ class LabRobotNode(Node):
             self.create_subscription(PoseStamped, topics["pose"], robot.pose_cb, 10)
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
             if Go2FrontVideoData is not None:
+                # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
+                # RELIABLE depth-10 subscription drops messages under the burst
+                # load, which slices gaps into the H.264 stream and makes it
+                # impossible to decode any frame. Use BEST_EFFORT + a deep
+                # history so the newest contiguous bytes arrive without gap.
+                cam_qos = QoSProfile(
+                    depth=100,
+                    reliability=ReliabilityPolicy.BEST_EFFORT,
+                    durability=DurabilityPolicy.VOLATILE,
+                )
                 self.create_subscription(
-                    Go2FrontVideoData, topics["camera"], robot.camera_cb, 10
+                    Go2FrontVideoData, topics["camera"], robot.camera_cb,
+                    qos_profile=cam_qos,
                 )
             if LowState is not None:
                 self.create_subscription(LowState, topics["battery"], robot.battery_cb, 10)
