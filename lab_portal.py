@@ -70,10 +70,13 @@ CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
 # Ignore the buffer until it holds at least this much data (enough for a
 # keyframe sequence) -- avoids decoding a nearly-empty, undecodable buffer.
 CAM_MIN_BYTES = 512 * 1024
-# Background decode cadence (s). Governs how often the camera refreshes.
+# Background decode cadence (s). Governs how often a new batch is decoded.
 CAM_DECODE_INTERVAL = 0.4
-# Frames read from each decoded keyframe segment. More = fresher, smoother.
-CAM_FRAMES_PER_DECODE = 8
+# Max frames to cache for smooth playback (one shot of motion per refill).
+CAM_FRAMES_MAX = 20
+# Cap the decoded segment to this many bytes -- we only need the most recent
+# keyframe onward, not the whole (up to several-MB) rolling buffer.
+CAM_DECODE_WINDOW = 2 * 1024 * 1024
 
 FT_FRAME = "lidar_map"
 
@@ -181,6 +184,7 @@ class RobotState:
         self.cam_frame_ts = 0.0
         self._cam_buf = bytearray()
         self._cam_lock = threading.Lock()
+        self._cam_frames = deque(maxlen=CAM_FRAMES_MAX)  # smooth-playback buffer
         self._last_decode = 0.0
         self._stop_cam = False
         # Camera decode strategy: the Go2 H.264 stream is fragmented across many
@@ -325,56 +329,52 @@ class RobotState:
         return None
 
     def _camera_decode_loop(self):
-        """Background decode thread: periodically decode the newest H.264
-        window (trimmed to the latest SPS keyframe) so the camera updates
-        continuously on the UI. Runs forever on its own thread."""
+        """Background decode thread: repeatedly decode the newest H.264 keyframe
+        segment and fill a buffer of frames. draw_camera() plays those frames at
+        full speed for smooth video while this thread refills in the background."""
         while not self._stop_cam:
             try:
                 if self.cam_stamp:
-                    frame = self._decode_camera_once()
-                    if frame is not None:
-                        self.color_frame = frame
+                    batch = self._decode_camera_batch()
+                    if batch:
+                        with self._cam_lock:
+                            self._cam_frames.extend(batch)
                         self.cam_frame_ts = time.time()
             except Exception as e:
                 self.node.get_logger().error(f"Camera decode failed: {e}")
             threading.Event().wait(CAM_DECODE_INTERVAL)
 
-    def _decode_camera_once(self):
-        """Decode the newest H.264 window into a frame (returns numpy or None).
+    def _decode_camera_batch(self):
+        """Decode the newest H.264 keyframe segment into a list of frames.
 
         Scans the whole rolling buffer for the most recent SPS keyframe so we
-        always cut to a clean, decodable SPS->PPS->IDR->frames sequence. Skips
-        (returns None) if no keyframe is currently buffered."""
+        always cut to a clean, decodable SPS->PPS->IDR->frames sequence, then
+        decodes as many frames as available so playback can be smooth. Returns
+        [] if no keyframe is currently buffered."""
         if not self._cam_buf:
-            return None
+            return []
         with self._cam_lock:
-            raw = bytes(self._cam_buf)
+            raw = bytes(self._cam_buf[-CAM_DECODE_WINDOW:])
         if len(raw) < CAM_MIN_BYTES:
-            return None
+            return []
         raw = self._trim_to_keyframe(raw)
         if not raw:
-            return None
+            return []
         tmp = f"/tmp/{self.name}_cam.h264"
         with open(tmp, "wb") as f:
             f.write(raw)
         cap = cv2.VideoCapture(tmp)
-        frame = None
-        seen = 0
-        # Decode a few frames and return the last -> the freshest image in the
-        # segment. More frames per pass = smoother, more up-to-date video.
-        while seen < CAM_FRAMES_PER_DECODE:
+        frames = []
+        while len(frames) < CAM_FRAMES_MAX:
             ret, f = cap.read()
             if not ret:
                 break
-            seen += 1
-            frame = f
+            h, w = f.shape[:2]
+            if w > CAM_W or h > CAM_H:
+                f = cv2.resize(f, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+            frames.append(f)
         cap.release()
-        if frame is None:
-            return None
-        h, w = frame.shape[:2]
-        if w > CAM_W or h > CAM_H:
-            frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
-        return frame
+        return frames
 
     def decode_camera(self):
         """Return the latest decoded frame instantly (decode runs in a thread).
@@ -422,10 +422,18 @@ class RobotState:
         return canvas
 
     def draw_camera(self):
-        self.decode_camera()
-        if self.color_frame is None:
+        # Play smoothly from the decoded frame queue (refilled in the
+        # background). When it runs dry, hold the last frame until the next
+        # batch is decoded -- gives fluid motion instead of one stamp per tick.
+        frame = None
+        with self._cam_lock:
+            if self._cam_frames:
+                frame = self._cam_frames.popleft()
+                self.color_frame = frame
+        if frame is None:
+            frame = self.color_frame
+        if frame is None:
             return _placeholder(640, 360, f"WAITING FOR {self.name.upper()} CAMERA...")
-        frame = self.color_frame
         h, w = frame.shape[:2]
         if w > 640 or h > 360:
             frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
