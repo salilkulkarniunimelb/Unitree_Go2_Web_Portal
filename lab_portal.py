@@ -666,7 +666,18 @@ class RobotState:
         if ref is None:
             return None
 
-        start = codes[ref][0]
+        # Prefer starting at the newest COMPLETE SPS->PPS->IDR(5) sequence so the
+        # returned segment is self-contained and does not rely on a cached
+        # parameter set that the camera may have renegotiated (a stale SPS+PPS
+        # prepended to newer slices is what makes cv2 yield zero frames forever).
+        best = codes[ref][0]
+        for i in range(len(codes) - 2):
+            if (nal_type_at(i) == 7 and nal_type_at(i + 1) == 8
+                    and nal_type_at(i + 2) == 5 and codes[i][0] <= best):
+                best = codes[i][0]
+                break
+
+        start = best
         # Cut before the NEXT SPS (a new parameter-set = a new clean access unit),
         # so the returned segment is a single self-contained GOP.
         end = len(raw)
@@ -710,9 +721,12 @@ class RobotState:
 
         Strategy: instead of requiring a keyframe to be present in the rolling
         window (which fails once the buffer scrolls past the one-time SPS/IDR,
-        causing the camera to freeze permanently), we prepend the cached SPS+PPS
-        parameter sets and, when available, split at the newest IDR/I-slice so the
-        decoder always has a valid reference to start from.
+        causing the camera to freeze permanently), we refresh the cached SPS+PPS
+        from the newest bytes each decode and, when available, split at the
+        newest SPS->PPS->IDR sequence so the decoder always has a valid reference
+        to start from. If a decode yields zero frames, the cached parameter sets
+        may be stale (the camera renegotiated its encoder) -- we clear them and
+        retry once against a freshly assembled segment so the stream self-heals.
         """
         if not self._cam_buf:
             return []
@@ -721,15 +735,37 @@ class RobotState:
             raw = bytes(self._cam_buf[-CAM_DECODE_WINDOW:])
         if len(raw) < CAM_MIN_BYTES:
             return []
-        if sps:
-            raw = self._trim_to_keyframe(raw) or raw
-            # Prepend the cached header so ffmpeg always has its parameter sets,
-            # even after the keyframe has scrolled out of the rolling buffer.
-            raw = sps + pps + raw
-        else:
-            raw = self._trim_to_keyframe(raw)
-            if not raw:
-                return []
+
+        def assemble(s, p):
+            r = self._trim_to_keyframe(raw)
+            if r is None:
+                return None
+            if s:
+                # Prepend the (refreshed) parameter sets so the decoder always
+                # has them, even after the keyframe scrolled out of the buffer.
+                return s + p + r
+            return r
+
+        seg = assemble(sps, pps)
+        if seg is None:
+            return []
+        frames = self._decode_segment(seg)
+        if frames:
+            return frames
+
+        # Zero frames from a valid keyframe segment -> cached params are stale.
+        # Refresh SPS/PPS from the newest bytes and retry once.
+        with self._cam_lock:
+            self._capture_headers(bytes(self._cam_buf[-CAM_DECODE_WINDOW:]))
+            sps, pps = self._sps, self._pps
+        seg = assemble(sps, pps)
+        if seg is None:
+            return []
+        return self._decode_segment(seg)
+
+    def _decode_segment(self, raw):
+        """Write raw H.264 bytes to a temp file and decode up to CAM_FRAMES_MAX
+        frames. Returns [] on failure so callers can trigger self-healing."""
         tmp = f"/tmp/{self.name}_cam.h264"
         with open(tmp, "wb") as f:
             f.write(raw)
