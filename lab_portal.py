@@ -185,6 +185,8 @@ class RobotState:
         self._ffmpeg = None
         self._ffmpeg_lock = threading.Lock()
         self._stop_cam = False
+        self._feed_carry = b""
+        self._synced = False
         # Primary decode: continuous ffmpeg pipe (smooth, low CPU). The
         # file-based decode stays as a rarely-used fallback thread below.
         self._start_ffmpeg_pipeline()
@@ -307,23 +309,72 @@ class RobotState:
                     os.set_blocking(self._ffmpeg.stdin.fileno(), False)
                 except OSError:
                     pass
+                self._synced = False
             except Exception as e:
                 self._ffmpeg = None
                 self.node.get_logger().warn(f"[{self.name}] ffmpeg start failed: {e}")
 
+    @staticmethod
+    def _scan_idr(data):
+        """Return the byte-offset of the first IDR (NAL type 5) in `data`, or -1.
+
+        ffmpeg decoding raw H.264 only produces frames once it hits a keyframe
+        (IDR). The Go2 stream is continuous, so we feed ffmpeg from the most
+        recent IDR boundary to keep it perpetually in sync."""
+        i = 0
+        n = len(data) - 4
+        while i < n:
+            if data[i] == 0 and data[i + 1] == 0:
+                if data[i + 2] == 1:
+                    hdr = i + 3
+                    sz = 3
+                elif data[i + 2] == 0 and data[i + 3] == 1:
+                    hdr = i + 4
+                    sz = 4
+                else:
+                    i += 1
+                    continue
+                if hdr < len(data):
+                    nal_type = (data[hdr] >> 5) & 0x1F
+                    if nal_type == 5:  # IDR
+                        return i
+                i += sz
+            else:
+                i += 1
+        return -1
+
     def _pipe_feed(self, data):
-        """Non-blocking write of H.264 bytes into ffmpeg stdin (drop if full)."""
+        """Feed H.264 into ffmpeg.
+
+        Raw H.264 needs to start at a keyframe (IDR) or ffmpeg can never sync
+        (endless 'non-existing PPS 0 referenced'). So the very first IDR we see
+        after (re)starting the decoder restarts ffmpeg at that boundary; after
+        that we just stream bytes continuously — ffmpeg stays in sync across
+        subsequent delta frames.
+
+        `self._feed_carry` carries buffered bytes across messages so an IDR
+        split across two messages is still detected."""
+        carry = self._feed_carry
+        combined = carry + data
+        self._feed_carry = combined[-4:]  # keep last 4 bytes for next scan
+        idr = self._scan_idr(combined)
+        if idr >= 0 and not self._synced:
+            # First keyframe after start -> restart decoder at a clean sync point
+            self._restart_ffmpeg(quiet=True)
+            combined = combined[idr:]
+            self._synced = True
         p = self._ffmpeg
         if p is None or p.stdin is None:
             return
         try:
-            os.write(p.stdin.fileno(), data)
+            os.write(p.stdin.fileno(), combined)
         except (BlockingIOError, BrokenPipeError, OSError) as e:
             if isinstance(e, BlockingIOError):
                 return  # decoder is behind live pace; drop stale bytes
             self._restart_ffmpeg()
+            self._synced = False
 
-    def _restart_ffmpeg(self):
+    def _restart_ffmpeg(self, quiet=False):
         with self._ffmpeg_lock:
             old = self._ffmpeg
             self._ffmpeg = None
@@ -333,7 +384,8 @@ class RobotState:
                 except Exception:
                     pass
         self._start_ffmpeg_pipeline()
-        self.node.get_logger().info(f"[{self.name}] restarting ffmpeg pipeline")
+        if not quiet:
+            self.node.get_logger().info(f"[{self.name}] restarting ffmpeg pipeline")
 
     def _ffmpeg_reader(self):
         """Continuously read decoded BGR frames from ffmpeg stdout and publish
