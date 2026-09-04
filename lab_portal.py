@@ -310,7 +310,8 @@ INIT_POSE_JS = """<script>
         svg = document.createElementNS(NS, 'svg');
         svg.setAttribute('style',
             'position:fixed;left:0;top:0;width:100vw;height:100vh;' +
-            'z-index:99999;pointer-events:none;overflow:visible;');
+            'z-index:99999;pointer-events:none;overflow:visible;' +
+            'touch-action:none;');
         svgDot = document.createElementNS(NS, 'circle');
         svgDot.setAttribute('r', '7');
         svgDot.setAttribute('fill', 'rgba(34,197,94,.95)');
@@ -362,27 +363,39 @@ INIT_POSE_JS = """<script>
     document.addEventListener('pointerdown', function (e) {
         var img = mapImg();
         if (!img || !ACTIVE || !inImg(e, img)) return;
-        // Only draw the pose arrow when the "Set Initial Pose" toggle is ON.
+        // Only the primary (left) mouse button — and only when the toggle is ON.
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
         var toggle = resolveEl('#initpose_toggle input');
         if (!toggle || !toggle.checked) return;
+        // Stop the browser/Gradio default (map pan / text-select) that would
+        // otherwise hijack a left-button drag, so left-click drag works.
+        e.preventDefault();
         var p = toImgPts(e, img);
         sPx = p[0]; sPy = p[1];
         sX = e.clientX; sY = e.clientY;
         dragging = true;
         makeArrow();
+        // Capture pointer events on the overlay so the drag does NOT pan the
+        // underlying map (Gradio's image pan must not fire while drawing).
+        svg.style.pointerEvents = 'auto';
         svg.style.display = '';
         drawArrow(e);
     });
 
     document.addEventListener('pointermove', function (e) {
         if (!dragging || !svg) return;
+        e.preventDefault();
         drawArrow(e);
     });
 
     document.addEventListener('pointerup', function (e) {
         if (!dragging) return;
         dragging = false;
-        if (svg) svg.style.display = 'none';
+        if (svg) {
+            svg.style.display = 'none';
+            // Release the overlay so normal map panning/clicking works again.
+            svg.style.pointerEvents = 'none';
+        }
         var img = mapImg();
         if (!img || !inImg(e, img)) return;
         var p2 = toImgPts(e, img);
@@ -820,15 +833,6 @@ class RobotState:
             ey = int(py - 30 * math.sin(self.yaw))
             cv2.arrowedLine(canvas, (px, py), (ex, ey), (0, 0, 0), 3)
 
-            # Pending / confirmed initial pose (green) so it is shown on the map
-            if self.initial_pose is not None:
-                ipx, ipy = to_px(self.initial_pose[0], self.initial_pose[1])
-                cv2.circle(canvas, (ipx, ipy), 8, (34, 197, 94), -1)
-                cv2.circle(canvas, (ipx, ipy), 10, (0, 120, 60), 2)
-                iex = int(ipx + 28 * math.cos(self.initial_pose[2]))
-                iey = int(ipy - 28 * math.sin(self.initial_pose[2]))
-                cv2.arrowedLine(canvas, (ipx, ipy), (iex, iey), (0, 150, 0), 3)
-
             canvas = cv2.rotate(canvas, cv2.ROTATE_90_CLOCKWISE)
             hc, wc = canvas.shape[:2]
             cv2.putText(canvas, "N", (wc // 2, 20), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1259,7 +1263,7 @@ def main():
                     init_bridge = gr.Textbox(visible=True, show_label=False,
                                              elem_id="initpose_bridge", scale=0)
 
-                gr.Markdown("**Legend:** 🔴 robot · green arrow = heading · blue = explored · dark = walls")
+                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · blue = explored · dark = walls")
 
                 with gr.Group():
                     gr.Markdown("#### FUTURE: 3D VIEW")
