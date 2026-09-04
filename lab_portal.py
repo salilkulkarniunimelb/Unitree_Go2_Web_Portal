@@ -67,11 +67,13 @@ ROBOTS = {
 # stream, so we buffer bytes and decode the newest SPS-keyframe window from a
 # file on a background thread. ffmpeg must be installed in the container.
 CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
-# Decode only the newest slice of the rolling buffer (enough for a keyframe
-# sequence) -- keeps each file decode small and fast.
-CAM_DECODE_WINDOW = 1 * 1024 * 1024
+# Ignore the buffer until it holds at least this much data (enough for a
+# keyframe sequence) -- avoids decoding a nearly-empty, undecodable buffer.
+CAM_MIN_BYTES = 512 * 1024
 # Background decode cadence (s). Governs how often the camera refreshes.
-CAM_DECODE_INTERVAL = 1.0
+CAM_DECODE_INTERVAL = 0.4
+# Frames read from each decoded keyframe segment. More = fresher, smoother.
+CAM_FRAMES_PER_DECODE = 8
 
 FT_FRAME = "lidar_map"
 
@@ -307,7 +309,7 @@ class RobotState:
 
         codes = start_codes(raw)
         if not codes:
-            return raw
+            return None
         sps = None
         for idx, (pos, sz) in enumerate(codes):
             hdr = pos + sz
@@ -318,8 +320,9 @@ class RobotState:
                 sps = pos
         if sps is not None:
             return raw[sps:]
-        # No SPS yet in window; fall back to start of stream (best effort)
-        return raw[codes[0][0]:]
+        # No SPS in the window -> not decodable yet (no clean keyframe start).
+        # Caller should skip; feeding a mid-stream slice only yields errors.
+        return None
 
     def _camera_decode_loop(self):
         """Background decode thread: periodically decode the newest H.264
@@ -337,14 +340,17 @@ class RobotState:
             threading.Event().wait(CAM_DECODE_INTERVAL)
 
     def _decode_camera_once(self):
-        """Decode the newest H.264 window into a frame (returns numpy or None)."""
+        """Decode the newest H.264 window into a frame (returns numpy or None).
+
+        Scans the whole rolling buffer for the most recent SPS keyframe so we
+        always cut to a clean, decodable SPS->PPS->IDR->frames sequence. Skips
+        (returns None) if no keyframe is currently buffered."""
         if not self._cam_buf:
             return None
         with self._cam_lock:
-            raw = bytes(self._cam_buf[-CAM_DECODE_WINDOW:])
-        if not raw:
+            raw = bytes(self._cam_buf)
+        if len(raw) < CAM_MIN_BYTES:
             return None
-        pre_trim = len(raw)
         raw = self._trim_to_keyframe(raw)
         if not raw:
             return None
@@ -354,7 +360,9 @@ class RobotState:
         cap = cv2.VideoCapture(tmp)
         frame = None
         seen = 0
-        while seen < 4:
+        # Decode a few frames and return the last -> the freshest image in the
+        # segment. More frames per pass = smoother, more up-to-date video.
+        while seen < CAM_FRAMES_PER_DECODE:
             ret, f = cap.read()
             if not ret:
                 break
@@ -362,8 +370,6 @@ class RobotState:
             frame = f
         cap.release()
         if frame is None:
-            self.node.get_logger().warn(
-                f"[{self.name}] cam decode no-frame (buf={pre_trim}, seg={len(raw)})")
             return None
         h, w = frame.shape[:2]
         if w > CAM_W or h > CAM_H:
