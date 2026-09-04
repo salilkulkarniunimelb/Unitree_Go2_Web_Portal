@@ -564,6 +564,23 @@ class LabRobotNode(Node):
         # called from a Gradio/anyio worker thread (it can corrupt the rclpy
         # context and crash the whole process).
         threading.Thread(target=self._goal_publish_loop, daemon=True).start()
+        threading.Thread(target=self._diag_loop, daemon=True).start()
+
+    def _diag_loop(self):
+        """Periodic heartbeat: log what each robot is actually receiving so we
+        can confirm map/pose/camera delivery. Diagnostic only."""
+        while True:
+            try:
+                for name, robot in self.robots.items():
+                    self.get_logger().info(
+                        f"[DIAG] {name}: map={robot.cached_map_img is not None} "
+                        f"pose={'y' if robot.robot_pose is not None else 'n'} "
+                        f"pose_txt={robot.pose_latest!r} cam_frame={'y' if robot.color_frame is not None else 'n'} "
+                        f"cam_ts={robot.cam_frame_ts:.1f}"
+                    )
+            except Exception as e:
+                self.get_logger().error(f"[DIAG] failed: {e}")
+            threading.Event().wait(5.0)
 
     def _goal_publish_loop(self):
         while True:
