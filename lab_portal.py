@@ -1261,10 +1261,17 @@ def main():
         conn_out = gr.Textbox(label="Connection Status", lines=2, interactive=False)
 
         # --- tickers (each independently safe; missing data => placeholder) ---
-        map_timer = gr.Timer(0.1)
+        # Map is redrawn at 2 Hz: a full occupancy-grid image shipped to the
+        # browser on every tick is the largest CPU/bandwidth driver. Slowing it
+        # to 0.5s frees CPU so the camera stream (below) can refresh smoothly
+        # instead of being starved by a 10 Hz map redraw.
+        map_timer = gr.Timer(0.5)
         map_timer.tick(lambda: node.draw_map(), outputs=map_img)
 
-        cam_timer = gr.Timer(0.2)
+        # Camera pulls decoded frames faster than before. Frames are produced by
+        # a background decode thread, so a quick 0.1s pull yields fluid playback
+        # without adding decode work -- it just drains the ready frame queue.
+        cam_timer = gr.Timer(0.1)
         cam_timer.tick(lambda: node.draw_camera(), outputs=cam_img)
 
         status_timer = gr.Timer(1.0)
