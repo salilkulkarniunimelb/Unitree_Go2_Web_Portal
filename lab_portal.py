@@ -344,6 +344,7 @@ class RobotState:
             raw = bytes(self._cam_buf[-CAM_DECODE_WINDOW:])
         if not raw:
             return None
+        pre_trim = len(raw)
         raw = self._trim_to_keyframe(raw)
         if not raw:
             return None
@@ -361,6 +362,8 @@ class RobotState:
             frame = f
         cap.release()
         if frame is None:
+            self.node.get_logger().warn(
+                f"[{self.name}] cam decode no-frame (buf={pre_trim}, seg={len(raw)})")
             return None
         h, w = frame.shape[:2]
         if w > CAM_W or h > CAM_H:
