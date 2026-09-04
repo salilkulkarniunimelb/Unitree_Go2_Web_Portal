@@ -28,6 +28,24 @@ def get_index_page(demo,launcher):
                         outputs=map_img
                     )
 
+                    map_click_status = gr.Textbox(label="Map Command", lines=1)
+                    def on_map_click(evt: gr.EventData):
+                        if evt is None or not hasattr(evt, "index") or evt.index is None:
+                            return "❌ No click data received. Try clicking the map image."
+                        wx, wy = launcher.map_subscriber.click_to_world(evt.index[0], evt.index[1])
+                        if wx is None or wy is None:
+                            return "⏳ Waiting for map/pose data... (check /map and /utlidar/robot_pose topics)"
+                        ok = launcher.nav2_controller.go_to({"x": wx, "y": wy, "yaw": launcher.map_subscriber.yaw})
+                        if not ok:
+                            return "❌ Nav2 navigate_to_pose server unavailable. Check `ros2 action list`."
+                        return f"🚀 Navigate to ({wx:.2f}, {wy:.2f})"
+
+                    map_img.select(
+                        fn=on_map_click,
+                        inputs=None,
+                        outputs=map_click_status
+                    )
+
 
                 gr.Markdown("### ⚙️ Sports Mode Actions")
 
@@ -61,6 +79,15 @@ def get_index_page(demo,launcher):
 
 
                 gr.Markdown("### 🔹 Additional Views")
+
+                cam_status = gr.Textbox(label="📷 Camera Status", lines=1, interactive=False)
+
+                def update_cam_status():
+                    return launcher.camera_status()
+
+                demo.load(update_cam_status, None, cam_status)
+                cam_timer = gr.Timer(2.0)
+                cam_timer.tick(fn=update_cam_status, inputs=None, outputs=cam_status)
 
                 # --- THREE SMALL CAMERAS ---
                 with gr.Row(elem_id="small-cam-row"):

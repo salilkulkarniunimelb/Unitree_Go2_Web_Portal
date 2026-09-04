@@ -1,0 +1,20 @@
+services:
+  web-portal:
+    build: .
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./config.py:/app/config.py
+      - ./data:/app/data
+      - ./assets:/app/assets
+    environment:
+      - ROS_DOMAIN_ID=0
+      - PYTHONUNBUFFERED=1
+    # For GPU support (uncomment if needed):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

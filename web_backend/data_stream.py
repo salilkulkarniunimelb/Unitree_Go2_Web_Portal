@@ -141,8 +141,35 @@ class DataStream:
     
 
 
+    def camera_status(self):
+        """Return a small text snapshot of every camera source for diagnostics."""
+        img = self.image_subscriber
+        rs = self.rs_image_subscriber
+        main_ok = img.color_frame is not None
+        yolo_ok = img.detection_frame is not None
+        rs_c_ok = rs.color_frame is not None
+        rs_d_ok = rs.depth_frame is not None
+        return (
+            f"Main camera: {'OK' if main_ok else 'STALE'} "
+            f"(frames={img.frame_count if main_ok else 0}) | "
+            f"YOLO: {'OK' if yolo_ok else 'STALE'} | "
+            f"RS color: {'OK' if rs_c_ok else 'STALE'} | "
+            f"RS depth: {'OK' if rs_d_ok else 'STALE'} | "
+            f"GStreamer: {self._gst_state()}"
+        )
+
+    def _gst_state(self):
+        try:
+            p = self.image_subscriber.gst_process
+            if p is None:
+                return "not-started"
+            return "running" if p.poll() is None else f"EXITED(rc={p.returncode})"
+        except Exception:
+            return "unknown"
+
     def live_cam_feed(self,mode:str):
-        
+        stale_logged = False
+
         while True:
             if mode=="color_image":
                 self.frame = self.image_subscriber.color_frame
@@ -201,11 +228,23 @@ class DataStream:
                     self.frame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
                     self.frame = cv2.resize(self.frame, (self.image_width, self.image_height))
 
+            if self.frame is not None:
+                stale_logged = False
+            elif not stale_logged:
+                # Log once per period when a feed dries up so we can tell whether
+                # the issue is the camera pipeline vs the dashboard rendering.
+                print(f"[live_cam_feed:{mode}] No frame received (camera stale). "
+                      f"color_frame={self.image_subscriber.color_frame is not None}, "
+                      f"detection_frame={self.image_subscriber.detection_frame is not None}, "
+                      f"rs_color={self.rs_image_subscriber.color_frame is not None}, "
+                      f"rs_depth={self.rs_image_subscriber.depth_frame is not None}")
+                stale_logged = True
+
             yield self.frame, self.description_cache
             time.sleep(self.sleep_interval)
 
 
-    
+        
         # ==============================
     # 📂 WAYPOINT HELPERS
     # ==============================
