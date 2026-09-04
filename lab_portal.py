@@ -1,20 +1,35 @@
 """
-lab_portal.py - Resilient live dashboard for the QOD lab Go2.
+lab_portal.py - 5G-Enabled Multi-Agent Mission Dashboard (QOD Lab).
+
+A Hivemind Mission Dashboard-style UI for the QOD lab Go2 robots (Luna & Astro).
 
 Runs inside the robot_hivemind ROS 2 (Humble) container and subscribes to the
 lab's real topics (bridged from the Go2 over Zenoh / domain 70):
 
     MAP     /lidar_slam_2d_map            (nav_msgs/msg/OccupancyGrid)
-    POSE    /go2/stabilized/current_pose  (geometry_msgs/msg/PoseStamped)
+    POSE    /luna/amcl_pose, /astro/amcl_pose  (geometry_msgs/msg/PoseWithCovarianceStamped)
     ODOM    /go2/restamped/robot_odom     (nav_msgs/msg/Odometry)
     CAMERA  /frontvideostream             (sensor_msgs/msg/Image)
     BATTERY /lf/lowstate                  (unitree_go/msg/LowState)
 
+Layout mirrors the Hivemind mission dashboard:
+    - Workflow stepper (mapping -> scenario -> localisation -> operations)
+    - Robot fleet panel (Luna / Astro cards with live status)
+    - Live occupancy map (center) + live camera (right)
+    - Telemetry + status footer
+
+Working features stream live (map, camera, battery, pose). Features not yet
+implemented (scenario/operations steps, 3D Foxglove view, ROS gateway, 5G
+link, RealSense/YOLO streams) are shown as disabled placeholders for future
+wiring, so the buttons/sections already exist.
+
 The page ALWAYS loads. Every section shows a "Waiting for ..." placeholder
-until its topic starts publishing, so the robot being offline never crashes
-or blank-screens the dashboard. Click the map to set a nav goal (/goal_pose).
-Toggle "Set Initial Pose" and drag on the map to publish an initial pose
-(/initialpose) for the selected robot, like Foxglove's "2D Publish Pose".
+until its topic starts publishing. Click the map to publish a navigation goal
+for the selected robot on its goal topic (e.g. /astro/goal_pose) in the "map"
+frame. This drives the robot only when a navigation stack on the robot consumes
+that goal topic. Toggle "Set Initial Pose" and drag on the map to publish an
+initial pose (/initialpose) for the selected robot, like Foxglove's
+"2D Publish Pose".
 
 Usage:
     source /opt/ros/humble/setup.bash
@@ -37,11 +52,14 @@ import gradio as gr
 # Topics actually publishing on the lab server (verified via ros2 topic list).
 # Each robot publishes under its own namespace (/luna/, /astro/).
 # - Map and camera are the live streams.
-# - Pose is shared on the unprefixed /go2/stabilized/current_pose topic.
+# - AMCL pose is per-robot (/luna/amcl_pose, /astro/amcl_pose) and is the
+#   accurate localization source for drawing each robot on the map.
+# - Odom is per-robot (/luna|astro/go2/restamped/robot_odom) and is used as a
+#   fallback pose source when AMCL is not publishing on a robot.
 # - No battery topic exists for either robot yet.
 LUNA_TOPICS = {
     "map":     "/luna/lidar_slam_2d_map",
-    "pose":    "/go2/stabilized/current_pose",
+    "pose":    "/luna/amcl_pose",
     "odom":    "/luna/go2/restamped/robot_odom",
     "camera":  "/luna/frontvideostream",
     "battery": "/lf/lowstate",
@@ -51,7 +69,7 @@ LUNA_TOPICS = {
 
 ASTRO_TOPICS = {
     "map":     "/astro/lidar_slam_2d_map",
-    "pose":    "/go2/stabilized/current_pose",
+    "pose":    "/astro/amcl_pose",
     "odom":    "/astro/go2/restamped/robot_odom",
     "camera":  "/astro/frontvideostream",
     "battery": "/lf/lowstate",
@@ -84,7 +102,7 @@ CAM_FRAMES_MAX = 20
 # fits in the window even as the buffer scrolls, keeping the camera continuous.
 CAM_DECODE_WINDOW = 4 * 1024 * 1024
 
-FT_FRAME = "lidar_map"
+FT_FRAME = "map"
 
 SERV_NAME = "0.0.0.0"
 SERV_PORT = 7860
@@ -145,17 +163,97 @@ DASHBOARD_CSS = """
     html, body, .gradio-container, .gradio-container * {
         font-family: Helvetica, 'Helvetica Neue', Arial, sans-serif !important;
     }
+    /* ---------- Hivemind Mission Dashboard style ----------
+       Colors are driven by Gradio theme CSS variables so switching the
+       theme in Settings applies everywhere (no hardcoded dark colors). */
+    .gradio-container{background:var(--background-fill-primary) !important;
+        color:var(--body-text-color) !important;max-width:100% !important;}
     .portal-header{display:flex;align-items:center;gap:14px;
-        padding:10px 12px;border-radius:12px;
-        background:linear-gradient(90deg,#0f2450,#000f46);
-        color:#fff;margin-bottom:4px;}
+        padding:14px 18px;border-radius:12px;
+        background:linear-gradient(90deg,var(--block-background-fill),var(--block-background-fill));
+        border:1px solid var(--block-border-color);
+        color:var(--block-title-text-color);margin-bottom:10px;}
     .portal-header img.logo{height:44px;width:auto;border-radius:8px;
         box-shadow:0 2px 8px rgba(0,0,0,.35);}
-    .portal-header .title{font-size:20px;font-weight:700;letter-spacing:.3px;}
-    .portal-header .subtitle{font-size:13px;opacity:.85;margin-top:2px;}
+    .portal-header .title{font-size:22px;font-weight:700;letter-spacing:.3px;
+        color:var(--color-accent);}
+    .portal-header .subtitle{font-size:13px;opacity:.85;margin-top:2px;
+        color:var(--body-text-color-subdued);}
     .robot-selector{margin-top:10px;}
     #initpose_bridge{pointer-events:none;opacity:0;height:0;overflow:hidden;}
     #initpose_bridge textarea{opacity:0;height:0;min-height:0!important;}
+
+    /* Blocks / cards */
+    .gr-block,.gr-box,.gr-form{background:transparent !important;}
+    .gr-group,.gr-gallery{background:var(--block-background-fill) !important;
+        border:1px solid var(--block-border-color) !important;
+        border-radius:12px !important;padding:12px !important;}
+
+    /* Workflow stepper */
+    .workflow-stepper{display:flex;align-items:center;gap:8px;
+        background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;padding:12px 16px;margin-bottom:10px;flex-wrap:wrap;}
+    .step{display:flex;align-items:center;gap:8px;
+        font-size:13px;color:var(--body-text-color-subdued);}
+    .step.active{color:var(--color-accent);font-weight:600;}
+    .step .step-num{width:22px;height:22px;border-radius:50%;
+        background:var(--border-color-primary);display:flex;align-items:center;
+        justify-content:center;font-size:11px;color:var(--color-accent);}
+    .step.active .step-num{background:var(--color-accent);color:var(--button-primary-text-color, #fff);}
+    .step-arrow{color:var(--border-color-primary);font-size:16px;}
+
+    /* Robot fleet */
+    .fleet-panel{display:flex;flex-direction:column;gap:10px;}
+    .robot-card{background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;padding:12px;margin-bottom:10px;}
+    .robot-card.selected{border-color:var(--color-accent);box-shadow:0 0 0 1px var(--color-accent);}
+    .robot-name{font-size:15px;font-weight:600;color:var(--block-title-text-color);
+        display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+    .robot-status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;}
+    .robot-status-dot.connected{background:#22c55e;box-shadow:0 0 6px #22c55e;}
+    .robot-status-dot.waiting{background:#f59e0b;box-shadow:0 0 6px #f59e0b;}
+    .telem-text{font-size:12px;color:var(--body-text-color-subdued);margin-top:4px;}
+
+    /* Live 3D mapping panel */
+    .map-panel{background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;padding:10px;}
+    .map-panel-title{font-size:15px;font-weight:600;color:var(--block-title-text-color);
+        display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+
+    /* Camera panel */
+    .camera-panel{background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;padding:10px;}
+
+    /* Status footer */
+    .status-footer{display:flex;gap:14px;flex-wrap:wrap;
+        background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;padding:10px 14px;margin-top:10px;font-size:12px;
+        color:var(--body-text-color-subdued);}
+    .status-item{display:flex;align-items:center;gap:6px;}
+    .status-item .lv{width:8px;height:8px;border-radius:50%;display:inline-block;}
+    .status-item .lv.green{background:#22c55e;}
+    .status-item .lv.yellow{background:#f59e0b;}
+    .status-item .lv.gray{background:#475569;}
+    .status-item .lv.blue{background:#3b82f6;}
+
+    .grid-2col{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .grid-3col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}
+
+    /* Future placeholder buttons */
+    .future-placeholder{display:flex;align-items:center;justify-content:center;
+        background:var(--input-background-fill);border:1px dashed var(--input-border-color);
+        border-radius:8px;color:var(--body-text-color-subdued);font-size:12px;
+        padding:8px 12px;min-height:36px;}
+
+    .section-label{font-size:13px;color:var(--color-accent);font-weight:600;
+        text-transform:uppercase;letter-spacing:.5px;margin:12px 0 8px;}
+    .section-label:first-child{margin-top:0;}
+
+    /* Mission buttons (future) */
+    .mission-buttons{display:flex;gap:8px;flex-wrap:wrap;}
+    .mission-buttons .gr-button{background:var(--input-background-fill);color:var(--color-accent);
+        border:1px solid var(--input-border-color);border-radius:8px !important;}
+    .mission-buttons .gr-button:hover{background:var(--border-color-primary);color:var(--body-text-color);}
 """
 
 # Foxglove-style click-and-drag to set the initial pose. The drag endpoints are
@@ -326,6 +424,7 @@ class RobotState:
         self.map_stamp = 0.0
         # --- pose / odom ---
         self.robot_pose = None
+        self.pose_from_amcl = False   # True once AMCL (accurate) pose received
         self.yaw = 0.0
         self.odom_path = deque(maxlen=2000)
         self.pose_latest = "Waiting for pose..."
@@ -409,15 +508,24 @@ class RobotState:
         self.map_stamp = self.node.get_clock().now().nanoseconds / 1e9
 
     def pose_cb(self, msg):
-        self.robot_pose = msg.pose
-        q = self.robot_pose.orientation
+        # The per-robot AMCL pose topics (/luna/amcl_pose, /astro/amcl_pose)
+        # are geometry_msgs/msg/PoseWithCovarianceStamped, where the pose lives
+        # at msg.pose.pose. The older PoseStamped path keeps msg.pose at the
+        # top level. Normalize so both feed the same drawing/telemetry code.
+        pose = getattr(msg, "pose", None)
+        if pose is None:
+            return
+        p = getattr(pose, "pose", pose)  # PoseWithCovarianceStamped -> .pose.pose
+        self.robot_pose = p
+        self.pose_from_amcl = True       # AMCL is the accurate per-robot source
+        q = p.orientation
         self.yaw = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
         self.pose_latest = (
-            f"x: {self.robot_pose.position.x:.3f}   "
-            f"y: {self.robot_pose.position.y:.3f}   "
+            f"x: {p.position.x:.3f}   "
+            f"y: {p.position.y:.3f}   "
             f"yaw: {self.yaw:.3f} rad"
         )
 
@@ -426,8 +534,11 @@ class RobotState:
         self.odom_path.append(
             (p.position.x, p.position.y)
         )
-        # The dedicated pose topic (/go2/stabilized/current_pose) has no
-        # publisher on this server, so derive pose from odometry instead.
+        # The per-robot odom topic is a fallback pose source. Once the accurate
+        # AMCL pose has been received, keep using AMCL (odom would otherwise
+        # drift / overwrite the localized position and misplace the robot dot).
+        if self.pose_from_amcl:
+            return
         q = p.orientation
         try:
             self.robot_pose = p
@@ -847,17 +958,21 @@ class RobotState:
         myp = (py - oy) / self.cached_scale
         wx = mx * res + origin_x
         wy = (h - 1 - myp) * res + origin_y
+        # Goal orientation: keep the robot's current heading so it drives to the
+        # clicked point (no heading requirement). Published on the goal topic
+        # (e.g. /astro/goal_pose) in the "map" frame.
         goal = PoseStamped()
-        goal.header.frame_id = FT_FRAME
+        goal.header.frame_id = FT_FRAME          # "map"
         goal.header.stamp = self.node.get_clock().now().to_msg()
         goal.pose.position.x = float(wx)
         goal.pose.position.y = float(wy)
-        goal.pose.orientation.w = 1.0
+        goal.pose.position.z = 0.0
+        half = self.yaw / 2.0
+        goal.pose.orientation.z = math.sin(half)
+        goal.pose.orientation.w = math.cos(half)
         self._goal_queue.put(goal)
         self.last_goal = (wx, wy)
         return f"{self.name}: Goal set -> ({wx:.3f}, {wy:.3f})"
-
-
 class LabRobotNode(Node):
     """Subscribes to map/pose/odom/camera/battery for every robot and exposes
     the currently-selected robot for rendering."""
@@ -875,7 +990,11 @@ class LabRobotNode(Node):
             map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
             self.create_subscription(OccupancyGrid, topics["map"], robot.map_cb,
                                      qos_profile=map_qos)
-            self.create_subscription(PoseStamped, topics["pose"], robot.pose_cb, 10)
+            # Per-robot AMCL pose (/luna/amcl_pose, /astro/amcl_pose) is
+            # geometry_msgs/msg/PoseWithCovarianceStamped and gives the accurate
+            # localized position for drawing each robot on the map.
+            self.create_subscription(PoseWithCovarianceStamped, topics["pose"],
+                                     robot.pose_cb, 10)
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
             if Go2FrontVideoData is not None:
                 # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
@@ -1011,10 +1130,6 @@ def main():
         secondary_hue=gr.themes.colors.blue,
         neutral_hue=gr.themes.colors.slate,
         font="Helvetica, 'Helvetica Neue', Arial, sans-serif",
-    ).set(
-        body_background_fill="#f4f6fb",
-        block_background_fill="#ffffff",
-        block_border_color="#e3e8f2",
     )
 
     logo_uri = logo_data_uri()
@@ -1023,49 +1138,127 @@ def main():
     <div class="portal-header">
         {logo_tag}
         <div>
-            <div class="title">QOD Lab · Go2 Live Dashboard</div>
-            <div class="subtitle">Map · Camera · Battery · Pose — live from the lab</div>
+            <div class="title">5G-Enabled Multi-Agent Mission Dashboard</div>
+            <div class="subtitle">E-12-DMAT-025 · Luna &amp; Astro · live telemetry from the lab</div>
         </div>
+    </div>
+
+    <!-- Workflow stepper (future steps, mission-type dependent) -->
+    <div class="workflow-stepper">
+        <div class="step active"><span class="step-num">1</span>mapping <small>Build the environment</small></div>
+        <span class="step-arrow">&#8594;</span>
+        <div class="step"><span class="step-num">2</span>scenario <small>Choose mission type</small></div>
+        <span class="step-arrow">&#8594;</span>
+        <div class="step"><span class="step-num">3</span>localisation <small>Place required robots</small></div>
+        <span class="step-arrow">&#8594;</span>
+        <div class="step"><span class="step-num">4</span>operations <small>Run the mission</small></div>
     </div>
     """
 
-    with gr.Blocks(title="QOD Lab - Go2 Live Dashboard") as demo:
+    with gr.Blocks(title="5G-Enabled Multi-Agent Mission Dashboard", theme=theme, css=DASHBOARD_CSS, head=INIT_POSE_JS) as demo:
         gr.HTML(header_html)
-        with gr.Row():
-            robot_dd = gr.Dropdown(
-                choices=list(ROBOTS.keys()),
-                value=node.current,
-                label="🤖 Select Robot",
-                interactive=True,
-                elem_classes=["robot-selector"],
-            )
-            conn_out = gr.Textbox(label="Connection", lines=1, interactive=False, scale=3)
 
+        # ================================================================
+        # TOP ROW: ROBOT FLEET (LEFT) + MAP (CENTER) + CAMERA (RIGHT)
+        # ================================================================
         with gr.Row():
-            with gr.Column(scale=3):
+            # ---------- LEFT: ROBOT FLEET ----------
+            with gr.Column(scale=1, elem_classes=["fleet-panel"]):
+                gr.Markdown("#### ROBOT FLEET")
+                robot_dd = gr.Dropdown(
+                    choices=list(ROBOTS.keys()),
+                    value=node.current,
+                    label="Select Robot",
+                    interactive=True,
+                    elem_classes=["robot-selector"],
+                )
+
+                # Luna card
+                with gr.Group(elem_classes=["robot-card"]):
+                    with gr.Row():
+                        gr.Markdown("### Luna")
+                        gr.Markdown("🟢 Connected")
+                    luna_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
+                    luna_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
+                    luna_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
+
+                # Astro card
+                with gr.Group(elem_classes=["robot-card"]):
+                    with gr.Row():
+                        gr.Markdown("### Astro")
+                        gr.Markdown("🟢 Connected")
+                    astro_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
+                    astro_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
+                    astro_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
+
+                gr.Markdown("#### FUTURE: MISSION CONTROLS")
+                with gr.Group(elem_classes=["mission-buttons"]):
+                    with gr.Row():
+                        gr.Button("🎯 Start Mapping", interactive=False)
+                    with gr.Row():
+                        gr.Button("🚀 Start Mission", interactive=False)
+                        gr.Button("⏹ Stop", interactive=False)
+
+            # ---------- CENTER: LIVE 3D MAPPING ----------
+            with gr.Column(scale=2, elem_classes=["map-panel"]):
+                gr.Markdown("## Live Mapping")
+
                 init_toggle = gr.Checkbox(
-                    label="✏️ Set Initial Pose — drag on the map (position = start, "
+                    label="Set Initial Pose — drag on the map (position = start, "
                           "orientation = drag direction)",
                     value=False,
                     elem_id="initpose_toggle",
                 )
-                map_img = gr.Image(label="Robot Map (click to set goal)",
-                                   type="numpy", elem_id="map_image")
-                goal_out = gr.Textbox(label="Goal Status", lines=1)
-                init_status = gr.Textbox(label="🟢 Initial Pose Status", lines=1,
-                                         interactive=False)
-                init_bridge = gr.Textbox(visible=True, show_label=False,
-                                         elem_id="initpose_bridge")
-            with gr.Column(scale=2):
-                cam_img = gr.Image(label="Camera", type="numpy")
 
+                map_img = gr.Image(label="Occupancy Map — click to set a nav goal",
+                                   type="numpy", elem_id="map_image", height=520)
+                goal_out = gr.Textbox(label="Goal Status", lines=1)
+
+                with gr.Row():
+                    init_status = gr.Textbox(label="🟢 Initial Pose Status", lines=1,
+                                             interactive=False, scale=2)
+                    init_bridge = gr.Textbox(visible=True, show_label=False,
+                                             elem_id="initpose_bridge", scale=0)
+
+                gr.Markdown("**Legend:** 🔴 robot · green arrow = heading · blue = explored · dark = walls")
+
+                with gr.Group():
+                    gr.Markdown("#### FUTURE: 3D VIEW")
+                    gr.Textbox(label="3D Foxglove Panel (port 8765)", value="Awaiting ROS gateway...",
+                               lines=1, interactive=False)
+
+            # ---------- RIGHT: LIVE CAMERA ----------
+            with gr.Column(scale=1, elem_classes=["camera-panel"]):
+                gr.Markdown("## Live Camera")
+                cam_img = gr.Image(label="Forward Camera — selected robot",
+                                   type="numpy", height=300)
+                cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
+                gr.Markdown("#### FUTURE: ADDITIONAL VIEWS")
+                with gr.Group():
+                    with gr.Row():
+                        gr.Button("📷 Depth", interactive=False)
+                        gr.Button("🎨 Color", interactive=False)
+                        gr.Button("🔍 YOLO", interactive=False)
+                with gr.Group():
+                    gr.Textbox(label="RealSense Depth", value="Awaiting stream...",
+                               lines=1, interactive=False)
+                    gr.Textbox(label="RealSense Color", value="Awaiting stream...",
+                               lines=1, interactive=False)
+                    gr.Textbox(label="YOLO Detections", value="Awaiting stream...",
+                               lines=1, interactive=False)
+
+        # ================================================================
+        # BOTTOM ROW: TELEMETRY + STATUS FOOTER
+        # ================================================================
         with gr.Row():
             with gr.Column():
-                battery_out = gr.Textbox(label="🔋 Battery", lines=1)
-                motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=4)
+                battery_out = gr.Textbox(label="🔋 Battery", lines=2)
                 orient_out = gr.Textbox(label="📐 Orientation", lines=2)
             with gr.Column():
                 pose_out = gr.Textbox(label="📍 Pose", lines=2)
+                motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=3)
+
+        conn_out = gr.Textbox(label="Connection Status", lines=2, interactive=False)
 
         # --- tickers (each independently safe; missing data => placeholder) ---
         map_timer = gr.Timer(0.1)
@@ -1082,13 +1275,36 @@ def main():
                 node.get_motor_data(),
                 node.get_orientation_data(),
                 node.get_pose_data(),
+                f"{node.current_robot.cam_fps:.1f} fps",
             ),
-            outputs=[conn_out, battery_out, motor_out, orient_out, pose_out],
+            outputs=[conn_out, battery_out, motor_out, orient_out, pose_out, cam_fps_out],
+        )
+
+        # Populate per-robot status cards
+        robot_status_timer = gr.Timer(2.0)
+
+        def robot_status():
+            texts = []
+            for name in node.robots:
+                robot = node.robots[name]
+                now = node.get_clock().now().nanoseconds / 1e9
+                map_ok = "🟢 live" if robot.map_stamp > 0 and now - robot.map_stamp < 5.0 else ("🟡 stale" if robot.map_stamp > 0 else "⚪ waiting")
+                pose_ok = "🟢 live" if robot.robot_pose is not None else "⚪ waiting"
+                cam_ok = "🟢 live" if robot.cam_fps > 0.5 else "⚪ waiting"
+                texts.append(map_ok)
+                texts.append(pose_ok)
+                texts.append(cam_ok)
+            return texts
+
+        robot_status_timer.tick(
+            robot_status,
+            outputs=[luna_map_status, luna_pose_status, luna_cam_status,
+                     astro_map_status, astro_pose_status, astro_cam_status],
         )
 
         def on_map_select(mode, evt: gr.SelectData):
             if mode:
-                return ("✏️ Initial Pose mode ON — press and drag on the map to "
+                return ("Initial Pose mode ON — press and drag on the map to "
                         "set the initial pose (position + orientation).")
             return node.click_to_goal(evt)
 
@@ -1117,9 +1333,6 @@ def main():
     demo.launch(
         server_name=SERV_NAME,
         server_port=SERV_PORT,
-        theme=theme,
-        css=DASHBOARD_CSS,
-        head=INIT_POSE_JS,
     )
 
 
