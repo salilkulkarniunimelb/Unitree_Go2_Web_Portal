@@ -19,12 +19,8 @@ Usage:
     python3 lab_portal.py            # serves on 0.0.0.0:7860
 """
 
-import errno
 import math
-import os
 import queue
-import select
-import subprocess
 import threading
 import time
 import base64
@@ -66,14 +62,16 @@ ROBOTS = {
 
 # Luna's camera is H.264-encoded Go2FrontVideoData. We decode it with a
 # persistent ffmpeg pipeline (started once per robot) fed via stdin and read
-# decoded BGR frames from stdout — no repeated file-open, so it is smooth and
-# cheap. ffmpeg must be installed in the container (see restore_dashboard.sh).
+# Camera frames arrive as raw H.264 Go2FrontVideoData, fragmented across many
+# small ROS messages. A persistent ffmpeg pipe cannot stay in sync on this
+# stream, so we buffer bytes and decode the newest SPS-keyframe window from a
+# file on a background thread. ffmpeg must be installed in the container.
 CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
-# Decode only the newest slice for the file-based fallback decode.
+# Decode only the newest slice of the rolling buffer (enough for a keyframe
+# sequence) -- keeps each file decode small and fast.
 CAM_DECODE_WINDOW = 1 * 1024 * 1024
-# If the ffmpeg pipe delivers no frame for this long (s), fall back to the
-# slower file-based decode so the camera never fully blanks.
-CAM_PIPE_FALLBACK = 4.0
+# Background decode cadence (s). Governs how often the camera refreshes.
+CAM_DECODE_INTERVAL = 1.0
 
 FT_FRAME = "lidar_map"
 
@@ -182,15 +180,13 @@ class RobotState:
         self._cam_buf = bytearray()
         self._cam_lock = threading.Lock()
         self._last_decode = 0.0
-        self._ffmpeg = None
-        self._ffmpeg_lock = threading.Lock()
         self._stop_cam = False
-        self._feed_carry = b""
-        self._synced = False
-        # Primary decode: continuous ffmpeg pipe (smooth, low CPU). The
-        # file-based decode stays as a rarely-used fallback thread below.
-        self._start_ffmpeg_pipeline()
-        threading.Thread(target=self._ffmpeg_reader, daemon=True).start()
+        # Camera decode strategy: the Go2 H.264 stream is fragmented across many
+        # small ROS messages, so a persistent ffmpeg pipe can never stay in sync
+        # (constant "no frame!" / "non-existing PPS"). Instead we buffer bytes,
+        # trim the tail to the latest SPS keyframe sequence, and decode that
+        # window from a file on a background thread. Reliable, keeps the icon
+        # green, and delivers a live multi-fps camera.
         threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
         self.battery = None
@@ -281,153 +277,16 @@ class RobotState:
                 # keep a bounded trailing window (enough for a full IDR+frames)
                 if len(self._cam_buf) > CAM_BUFFER_MAX:
                     del self._cam_buf[: len(self._cam_buf) - CAM_BUFFER_MAX]
-            self._pipe_feed(data)
             self.cam_stamp = self.node.get_clock().now().nanoseconds / 1e9
         except Exception as e:
             self.node.get_logger().error(f"Camera buffer failed: {e}")
 
-    # ------------------ persistent ffmpeg pipeline ------------------
-    def _start_ffmpeg_pipeline(self):
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-probesize", "1024", "-analyzeduration", "0",
-            "-f", "h264", "-i", "pipe:0",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-r", "12",               # throttle output to ~12 fps (we don't
-            "-flush_packets", "1",    # need the full 85fps -> far less CPU)
-            "pipe:1",
-        ]
-        with self._ffmpeg_lock:
-            try:
-                self._ffmpeg = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    bufsize=0,
-                )
-                os.set_blocking(self._ffmpeg.stdout.fileno(), False)
-                try:
-                    os.set_blocking(self._ffmpeg.stdin.fileno(), False)
-                except OSError:
-                    pass
-                self._synced = False
-            except Exception as e:
-                self._ffmpeg = None
-                self.node.get_logger().warn(f"[{self.name}] ffmpeg start failed: {e}")
-
-    @staticmethod
-    def _scan_idr(data):
-        """Return the byte-offset of the first IDR (NAL type 5) in `data`, or -1.
-
-        ffmpeg decoding raw H.264 only produces frames once it hits a keyframe
-        (IDR). The Go2 stream is continuous, so we feed ffmpeg from the most
-        recent IDR boundary to keep it perpetually in sync."""
-        i = 0
-        n = len(data) - 4
-        while i < n:
-            if data[i] == 0 and data[i + 1] == 0:
-                if data[i + 2] == 1:
-                    hdr = i + 3
-                    sz = 3
-                elif data[i + 2] == 0 and data[i + 3] == 1:
-                    hdr = i + 4
-                    sz = 4
-                else:
-                    i += 1
-                    continue
-                if hdr < len(data):
-                    nal_type = (data[hdr] >> 5) & 0x1F
-                    if nal_type == 5:  # IDR
-                        return i
-                i += sz
-            else:
-                i += 1
-        return -1
-
-    def _pipe_feed(self, data):
-        """Feed H.264 into ffmpeg.
-
-        Raw H.264 needs to start at a keyframe (IDR) or ffmpeg can never sync
-        (endless 'non-existing PPS 0 referenced'). So the very first IDR we see
-        after (re)starting the decoder restarts ffmpeg at that boundary; after
-        that we just stream bytes continuously — ffmpeg stays in sync across
-        subsequent delta frames.
-
-        `self._feed_carry` carries buffered bytes across messages so an IDR
-        split across two messages is still detected."""
-        carry = self._feed_carry
-        combined = carry + data
-        self._feed_carry = combined[-4:]  # keep last 4 bytes for next scan
-        idr = self._scan_idr(combined)
-        if idr >= 0 and not self._synced:
-            # First keyframe after start -> restart decoder at a clean sync point
-            self._restart_ffmpeg(quiet=True)
-            combined = combined[idr:]
-            self._synced = True
-        p = self._ffmpeg
-        if p is None or p.stdin is None:
-            return
-        try:
-            os.write(p.stdin.fileno(), combined)
-        except (BlockingIOError, BrokenPipeError, OSError) as e:
-            if isinstance(e, BlockingIOError):
-                return  # decoder is behind live pace; drop stale bytes
-            self._restart_ffmpeg()
-            self._synced = False
-
-    def _restart_ffmpeg(self, quiet=False):
-        with self._ffmpeg_lock:
-            old = self._ffmpeg
-            self._ffmpeg = None
-            if old is not None:
-                try:
-                    old.terminate()
-                except Exception:
-                    pass
-        self._start_ffmpeg_pipeline()
-        if not quiet:
-            self.node.get_logger().info(f"[{self.name}] restarting ffmpeg pipeline")
-
-    def _ffmpeg_reader(self):
-        """Continuously read decoded BGR frames from ffmpeg stdout and publish
-        them into self.color_frame."""
-        size = CAM_W * CAM_H * 3
-        buf = b""
-        while not self._stop_cam:
-            p = self._ffmpeg
-            if p is None or p.stdout is None:
-                if self._ffmpeg is None:
-                    self._restart_ffmpeg()
-                threading.Event().wait(0.5)
-                continue
-            try:
-                r, _, _ = select.select([p.stdout], [], [], 0.2)
-                if not r:
-                    continue
-                d = os.read(p.stdout.fileno(), 65536)
-                if not d:
-                    self._restart_ffmpeg()
-                    buf = b""
-                    continue
-                buf += d
-                while len(buf) >= size:
-                    frame = np.frombuffer(buf[:size], dtype=np.uint8).copy()
-                    frame = frame.reshape((CAM_H, CAM_W, 3))
-                    buf = buf[size:]
-                    self.color_frame = frame
-                    self.cam_frame_ts = time.time()
-            except (BrokenPipeError, OSError):
-                self._restart_ffmpeg()
-                buf = b""
-                continue
-            except Exception:
-                buf = b""
-                continue
-
     @staticmethod
     def _trim_to_keyframe(raw):
         """Trim a raw H.264 Annex-B byte buffer so it starts at the most recent
-        keyframe (IDR, NAL type 5). cv2.VideoCapture needs a clean IDR at the
-        start of the file or it can never sync and returns no frame."""
+        SPS (NAL type 7). The Go2 stream emits SPS->PPS->IDR then P-frames, so
+        starting at the SPS gives the decoder everything it needs (SPS+PPS+IDR)
+        to sync — cv2.VideoCapture returns no frame without a clean start."""
         def start_codes(data):
             i = 0
             n = len(data) - 4
@@ -449,37 +308,33 @@ class RobotState:
         codes = start_codes(raw)
         if not codes:
             return raw
-        idr = None
+        sps = None
         for idx, (pos, sz) in enumerate(codes):
             hdr = pos + sz
             if hdr >= len(raw):
                 break
-            nal_type = (raw[hdr] >> 5) & 0x1F
-            if nal_type == 5:  # IDR
-                idr = pos
-        if idr is not None:
-            return raw[idr:]
-        # No IDR yet in window; fall back to start of stream (best effort)
+            nal_type = raw[hdr] & 0x1F
+            if nal_type == 7:  # SPS (precedes PPS+IDR -> lets ffmpeg sync)
+                sps = pos
+        if sps is not None:
+            return raw[sps:]
+        # No SPS yet in window; fall back to start of stream (best effort)
         return raw[codes[0][0]:]
 
     def _camera_decode_loop(self):
-        """Low-frequency fallback decode thread.
-
-        The primary source is the continuous ffmpeg pipe. This thread only
-        kicks in (file-based decode ~4s apart) if the pipe has delivered no
-        frame recently, so the camera never fully blanks if ffmpeg struggles."""
+        """Background decode thread: periodically decode the newest H.264
+        window (trimmed to the latest SPS keyframe) so the camera updates
+        continuously on the UI. Runs forever on its own thread."""
         while not self._stop_cam:
-            if self.cam_frame_ts and time.time() - self.cam_frame_ts < CAM_PIPE_FALLBACK:
-                threading.Event().wait(2.0)
-                continue
             try:
-                frame = self._decode_camera_once()
-                if frame is not None:
-                    self.color_frame = frame
-                    self.cam_frame_ts = time.time()
+                if self.cam_stamp:
+                    frame = self._decode_camera_once()
+                    if frame is not None:
+                        self.color_frame = frame
+                        self.cam_frame_ts = time.time()
             except Exception as e:
                 self.node.get_logger().error(f"Camera decode failed: {e}")
-            threading.Event().wait(4.0)
+            threading.Event().wait(CAM_DECODE_INTERVAL)
 
     def _decode_camera_once(self):
         """Decode the newest H.264 window into a frame (returns numpy or None)."""
