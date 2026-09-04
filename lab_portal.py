@@ -291,7 +291,8 @@ class RobotState:
             "-probesize", "1024", "-analyzeduration", "0",
             "-f", "h264", "-i", "pipe:0",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-flush_packets", "1",
+            "-r", "12",               # throttle output to ~12 fps (we don't
+            "-flush_packets", "1",    # need the full 85fps -> far less CPU)
             "pipe:1",
         ]
         with self._ffmpeg_lock:
