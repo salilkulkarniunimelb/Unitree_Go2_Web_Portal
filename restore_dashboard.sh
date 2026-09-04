@@ -50,17 +50,37 @@ $SCP lab_portal.py lab_start.sh "$SERVER:/tmp/"
 $SSH "docker cp /tmp/lab_portal.py $CONTAINER:/workspace/lab_portal.py"
 $SSH "docker cp /tmp/lab_start.sh $CONTAINER:/workspace/lab_start.sh"
 $SSH "docker exec $CONTAINER chmod +x /workspace/lab_start.sh"
+# The dashboard logo and any assets are served from the container, so copy
+# the whole assets/ folder (missing logo caused a FileNotFoundError crash).
+if [ -d assets ]; then
+    echo "  -> Copying assets/ into container..."
+    if ! $SSH "docker exec $CONTAINER ls /workspace/assets >/dev/null 2>&1"; then
+        $SSH "docker exec $CONTAINER mkdir -p /workspace/assets"
+    fi
+    for f in assets/*; do
+        [ -f "$f" ] || continue
+        bn=$(basename "$f")
+        $SCP "$f" "$SERVER:/tmp/$bn"
+        $SSH "docker cp /tmp/$bn $CONTAINER:/workspace/assets/$bn"
+    done
+fi
 
 # --- 4) Ensure Python deps --------------------------------------------------
 echo "[3/5] Ensuring Python deps (installs only if missing)..."
+# NOTE: numpy is pinned to <2 because the ROS cv_bridge package was compiled
+# against NumPy 1.x and crashes with NumPy 2.x (_ARRAY_API not found), and
+# opencv is pinned to <5 to stay numpy<2 compatible.
 $SSH "docker exec $CONTAINER bash -lc '
     if ! python3 -c \"import gradio,numpy,cv2\" 2>/dev/null; then
         if ! python3 -m pip --version >/dev/null 2>&1; then
             apt-get update -qq && apt-get install -y -qq python3-pip
         fi
-        python3 -m pip install --no-cache-dir numpy opencv-python-headless gradio
-    else
+        python3 -m pip install --no-cache-dir \"numpy<2\" \"opencv-python-headless<5\" gradio
+    elif python3 -c \"import numpy,sys; sys.exit(0 if numpy.__version__.startswith(chr(49)) else 1)\" 2>/dev/null; then
         echo deps-ok
+    else
+        echo \"  -> numpy >= 2 detected, downgrading to <2 for cv_bridge compat...\"
+        python3 -m pip install --no-cache-dir \"numpy<2\" \"opencv-python-headless<5\"
     fi
 '"
 

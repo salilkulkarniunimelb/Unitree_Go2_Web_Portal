@@ -63,6 +63,9 @@ ROBOTS = {
 # Luna's camera is H.264-encoded Go2FrontVideoData. cv2.VideoCapture (FFmpeg
 # backend) decodes it from a rolling buffer written to a temp file.
 CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
+# Decode only the newest slice (still spans many keyframes at ~85fps) — scanning
+# and re-opening the whole 6MB buffer every tick is what pegged the CPU.
+CAM_DECODE_WINDOW = 1 * 1024 * 1024
 
 FT_FRAME = "lidar_map"
 
@@ -73,6 +76,7 @@ SERV_PORT = 7860
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image
@@ -107,12 +111,16 @@ _LOGO_URI = None
 
 def logo_data_uri(path="assets/logo.png"):
     """Return the logo as a base64 data URI so it renders regardless of how
-    Gradio serves static files (works over SSH tunnels / containers)."""
+    Gradio serves static files (works over SSH tunnels / containers).
+    Returns "" if the file is missing so the page never crashes."""
     global _LOGO_URI
     if _LOGO_URI is None:
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        _LOGO_URI = f"data:image/png;base64,{b64}"
+        try:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            _LOGO_URI = f"data:image/png;base64,{b64}"
+        except FileNotFoundError:
+            _LOGO_URI = ""
     return _LOGO_URI
 
 
@@ -165,6 +173,9 @@ class RobotState:
         self._cam_buf = bytearray()
         self._cam_lock = threading.Lock()
         self._last_decode = 0.0
+        # Decode runs on its OWN thread so the heavy H.264 decode never blocks
+        # the Gradio event-loop / status tickers.
+        threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
         self.battery = None
         self.voltage = None
@@ -257,39 +268,92 @@ class RobotState:
         except Exception as e:
             self.node.get_logger().error(f"Camera buffer failed: {e}")
 
-    def decode_camera(self):
-        """Decode the latest H.264 window into a frame (rate-limited ~2Hz)."""
+    @staticmethod
+    def _trim_to_keyframe(raw):
+        """Trim a raw H.264 Annex-B byte buffer so it starts at the most recent
+        keyframe (IDR, NAL type 5). cv2.VideoCapture needs a clean IDR at the
+        start of the file or it can never sync and returns no frame."""
+        def start_codes(data):
+            i = 0
+            n = len(data) - 4
+            pos = []
+            while i < n:
+                if data[i] == 0 and data[i + 1] == 0:
+                    if data[i + 2] == 1:
+                        pos.append((i, 3))
+                        i += 3
+                    elif data[i + 2] == 0 and data[i + 3] == 1:
+                        pos.append((i, 4))
+                        i += 4
+                    else:
+                        i += 1
+                else:
+                    i += 1
+            return pos
+
+        codes = start_codes(raw)
+        if not codes:
+            return raw
+        idr = None
+        for idx, (pos, sz) in enumerate(codes):
+            hdr = pos + sz
+            if hdr >= len(raw):
+                break
+            nal_type = (raw[hdr] >> 5) & 0x1F
+            if nal_type == 5:  # IDR
+                idr = pos
+        if idr is not None:
+            return raw[idr:]
+        # No IDR yet in window; fall back to start of stream (best effort)
+        return raw[codes[0][0]:]
+
+    def _camera_decode_loop(self):
+        """Dedicated thread: trim to keyframe, decode newest window, update
+        self.color_frame. Runs off the Gradio thread so it never stalls the UI."""
+        while True:
+            try:
+                frame = self._decode_camera_once()
+                if frame is not None:
+                    self.color_frame = frame
+            except Exception as e:
+                self.node.get_logger().error(f"Camera decode failed: {e}")
+            threading.Event().wait(2.0)
+
+    def _decode_camera_once(self):
+        """Decode the newest H.264 window into a frame (returns numpy or None)."""
         if not self._cam_buf:
             return None
-        now = time.time()
-        if now - self._last_decode < 0.4:
-            return self.color_frame
-        self._last_decode = now
-        try:
-            with self._cam_lock:
-                raw = bytes(self._cam_buf[-CAM_BUFFER_MAX:])
-            if not raw:
-                return None
-            tmp = f"/tmp/{self.name}_cam.h264"
-            with open(tmp, "wb") as f:
-                f.write(raw)
-            cap = cv2.VideoCapture(tmp)
-            frame = None
-            for _ in range(600):
-                ret, f = cap.read()
-                if not ret:
-                    break
-                frame = f
-            cap.release()
-            if frame is not None:
-                h, w = frame.shape[:2]
-                if w > CAM_W or h > CAM_H:
-                    frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
-                self.color_frame = frame
-            return frame
-        except Exception as e:
-            self.node.get_logger().error(f"Camera decode failed: {e}")
+        with self._cam_lock:
+            raw = bytes(self._cam_buf[-CAM_DECODE_WINDOW:])
+        if not raw:
             return None
+        raw = self._trim_to_keyframe(raw)
+        if not raw:
+            return None
+        tmp = f"/tmp/{self.name}_cam.h264"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        cap = cv2.VideoCapture(tmp)
+        frame = None
+        seen = 0
+        while seen < 4:
+            ret, f = cap.read()
+            if not ret:
+                break
+            seen += 1
+            frame = f
+        cap.release()
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        if w > CAM_W or h > CAM_H:
+            frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+        return frame
+
+    def decode_camera(self):
+        """Return the latest decoded frame instantly (decode runs in a thread).
+        Never blocks the UI: there is always a cached frame or the placeholder."""
+        return self.color_frame
 
     def battery_cb(self, msg):
         self.battery = msg.bms_state.soc
@@ -441,7 +505,12 @@ class LabRobotNode(Node):
             robot = RobotState(self, name, topics)
 
             # All subscriptions are optional: ROS waits silently for any topic.
-            self.create_subscription(OccupancyGrid, topics["map"], robot.map_cb, 10)
+            # The map publishers (map_server / completed-map relays) use
+            # TRANSIENT_LOCAL durability, so we MUST subscribe with the same
+            # durability, otherwise no map message is ever delivered.
+            map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(OccupancyGrid, topics["map"], robot.map_cb,
+                                     qos_profile=map_qos)
             self.create_subscription(PoseStamped, topics["pose"], robot.pose_cb, 10)
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
             if Go2FrontVideoData is not None:
@@ -536,9 +605,11 @@ def main():
         block_border_color="#e3e8f2",
     )
 
+    logo_uri = logo_data_uri()
+    logo_tag = f'<img class="logo" src="{logo_uri}" alt="logo"/>' if logo_uri else ""
     header_html = f"""
     <div class="portal-header">
-        <img class="logo" src="{logo_data_uri()}" alt="logo"/>
+        {logo_tag}
         <div>
             <div class="title">QOD Lab · Go2 Live Dashboard</div>
             <div class="subtitle">Map · Camera · Battery · Pose — live from the lab</div>
