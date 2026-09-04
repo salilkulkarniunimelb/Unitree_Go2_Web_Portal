@@ -93,6 +93,9 @@ CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
 # keyframe sequence) -- avoids decoding a nearly-empty, undecodable buffer.
 CAM_MIN_BYTES = 512 * 1024
 # Background decode cadence (s). Governs how often a new batch is decoded.
+# The Go2 source streams ~260 tiny H.264 fragments/s of only ~7 distinct display
+# frames/s, so decoding faster than 0.4s only re-produces duplicate frames and
+# costs CPU without raising the visible fps (which is source-limited).
 CAM_DECODE_INTERVAL = 0.4
 # Max frames to cache for smooth playback (one shot of motion per refill).
 CAM_FRAMES_MAX = 20
