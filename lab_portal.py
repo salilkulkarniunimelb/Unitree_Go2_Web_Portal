@@ -109,6 +109,11 @@ CAM_DECODE_WINDOW = 4 * 1024 * 1024
 
 FT_FRAME = "map"
 
+# Once the robot gets this close (meters) to the active goal, consider it
+# reached and clear the plotted path/goal marker from the map. Widen enough to
+# tolerate AMCL noise and Nav2 stopping a little short of the exact point.
+GOAL_REACHED_TOLERANCE = 1.0
+
 SERV_NAME = "0.0.0.0"
 SERV_PORT = 7860
 
@@ -845,13 +850,32 @@ class RobotState:
             return int(mx * scale) + ox, int(my * scale) + oy
 
         if self.robot_pose is not None:
+            # Once the robot arrives at the goal, clear the plan + goal marker
+            # so the path disappears from the map. "Arrived" = the current pose
+            # is within tolerance, or it just passed the goal (overshoot).
+            if self.last_goal is not None:
+                gx, gy = self.last_goal
+                d_now = math.hypot(
+                    self.robot_pose.position.x - gx,
+                    self.robot_pose.position.y - gy,
+                )
+                near = d_now < GOAL_REACHED_TOLERANCE
+                if not near:
+                    for hx, hy in list(self.odom_path)[-6:]:
+                        if math.hypot(hx - gx, hy - gy) < GOAL_REACHED_TOLERANCE:
+                            near = True
+                            break
+                if near:
+                    self.planner_path = None
+                    self.last_goal = None
+
             # Nav2 planned path (the route the robot is about to take).
             if self.planner_path and len(self.planner_path) >= 2:
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
                 )
-                cv2.polylines(canvas, [pts], False, (10, 10, 120), 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, (255, 120, 20), 3, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, (0, 0, 160), 7, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, (0, 0, 255), 3, cv2.LINE_AA)
 
             # Goal marker (orange crosshair + dot) at the last clicked point.
             if self.last_goal is not None:
@@ -1301,7 +1325,7 @@ def main():
                     init_bridge = gr.Textbox(visible=True, show_label=False,
                                              elem_id="initpose_bridge", scale=0)
 
-                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path** · **orange target = goal** · blue = explored · dark = walls")
+                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path (clears on arrival)** · **orange target = goal** · blue = explored · dark = walls")
 
                 with gr.Group():
                     gr.Markdown("#### FUTURE: 3D VIEW")
