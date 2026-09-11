@@ -870,12 +870,17 @@ class RobotState:
                     self.last_goal = None
 
             # Nav2 planned path (the route the robot is about to take).
+            # Color matches the robot: Luna = red, Astro = blue.
+            # NOTE: cv2 draws BGR but Gradio displays RGB, so these tuples
+            # equal the browser colours.
             if self.planner_path and len(self.planner_path) >= 2:
+                path_dark = (160, 0, 0) if self.name == "Luna" else (0, 0, 160)
+                path_bright = (255, 0, 0) if self.name == "Luna" else (0, 0, 255)
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
                 )
-                cv2.polylines(canvas, [pts], False, (0, 0, 160), 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, (0, 0, 255), 3, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, path_dark, 7, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, path_bright, 3, cv2.LINE_AA)
 
             # Goal marker (orange crosshair + dot) at the last clicked point.
             if self.last_goal is not None:
@@ -886,7 +891,8 @@ class RobotState:
                 cv2.line(canvas, (gx, gy - 14), (gx, gy + 14), (0, 165, 255), 2, cv2.LINE_AA)
 
             px, py = to_px(self.robot_pose.position.x, self.robot_pose.position.y)
-            cv2.circle(canvas, (px, py), 10, (255, 0, 0), -1)
+            dot = (255, 0, 0) if self.name == "Luna" else (0, 200, 255)
+            cv2.circle(canvas, (px, py), 10, dot, -1)
             ex = int(px + 30 * math.cos(self.yaw))
             ey = int(py - 30 * math.sin(self.yaw))
             cv2.arrowedLine(canvas, (px, py), (ex, ey), (0, 0, 0), 3)
@@ -1258,9 +1264,9 @@ class LabRobotNode(Node):
         # RGB, so these tuples equal the browser colours. Red = Luna, blue = Astro.
         robot_colors = {
             "Luna":  dict(fill=(255, 0, 0),  outline=(180, 0, 0),
-                          path=(0, 0, 220),  path_bright=(0, 0, 255)),
+                          path=(160, 0, 0),  path_bright=(255, 0, 0)),
             "Astro": dict(fill=(0, 200, 255), outline=(0, 140, 200),
-                          path=(200, 120, 0), path_bright=(255, 160, 0)),
+                          path=(0, 0, 160), path_bright=(0, 0, 255)),
         }
 
         # Draw each robot's plan + goal (same logic as single-robot draw_map).
