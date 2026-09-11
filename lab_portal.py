@@ -1396,7 +1396,7 @@ def main():
             # ================================================================
             # TAB 1: MAPPING (existing single-robot dashboard)
             # ================================================================
-            with gr.Tab("1 Mapping", id="mapping"):
+            with gr.Tab("Mapping", id="mapping"):
 
                 # ================================================================
                 # TOP ROW: ROBOT FLEET (LEFT) + MAP (CENTER) + CAMERA (RIGHT)
@@ -1580,7 +1580,7 @@ def main():
             # ================================================================
             # TAB 2: PATROLLING (both robots on one map)
             # ================================================================
-            with gr.Tab("2 Patrolling", id="patrolling"):
+            with gr.Tab("Patrolling", id="patrolling"):
                 # ---------- LEFT: PATROL CONTROLS ----------
                 with gr.Column(scale=1, elem_classes=["fleet-panel"]):
                     gr.Markdown("#### PATROL CONTROLS")
