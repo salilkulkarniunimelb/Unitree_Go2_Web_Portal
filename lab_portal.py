@@ -611,6 +611,10 @@ class RobotState:
                 (p.pose.position.x, p.pose.position.y) for p in msg.poses
             ]
             self.planner_path_stamp = self.node.get_clock().now().nanoseconds / 1e9
+            self.node.get_logger().info(
+                f"[{self.name}] /plan received: {len(self.planner_path)} pts "
+                f"frame={getattr(msg.header, 'frame_id', '?')!r}"
+            )
         except Exception as e:
             self.node.get_logger().error(f"[{self.name}] plan_cb failed: {e}")
 
@@ -1165,6 +1169,8 @@ class LabRobotNode(Node):
                     self.get_logger().info(
                         f"[DIAG] {name}: map={robot.cached_map_img is not None} "
                         f"pose={'y' if robot.robot_pose is not None else 'n'} "
+                        f"plan={'y' if robot.planner_path and len(robot.planner_path) >= 2 else 'n'} "
+                        f"plan_pts={len(robot.planner_path) if robot.planner_path else 0} "
                         f"pose_txt={robot.pose_latest!r} cam_frame={'y' if robot.color_frame is not None else 'n'} "
                         f"cam_ts={robot.cam_frame_ts:.1f} cam_fps={robot.cam_fps:.2f}"
                     )
