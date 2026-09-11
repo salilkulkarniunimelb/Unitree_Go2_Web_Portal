@@ -870,7 +870,8 @@ class RobotState:
                     self.last_goal = None
 
             # Nav2 planned path (the route the robot is about to take).
-            # Color matches the robot: Luna = red, Astro = blue.
+            # Color matches the robot: Luna = red, Astro = blue (same as its
+            # dot).  A black under-stroke provides contrast on the light map.
             # NOTE: cv2 draws BGR but Gradio displays RGB, so these tuples
             # equal the browser colours.
             if self.planner_path and len(self.planner_path) >= 2:
@@ -879,8 +880,9 @@ class RobotState:
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
                 )
+                cv2.polylines(canvas, [pts], False, (0, 0, 0), 10, cv2.LINE_AA)
                 cv2.polylines(canvas, [pts], False, path_dark, 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, path_bright, 3, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, path_bright, 4, cv2.LINE_AA)
 
             # Goal marker (orange crosshair + dot) at the last clicked point.
             if self.last_goal is not None:
@@ -1290,7 +1292,8 @@ class LabRobotNode(Node):
                     robot.planner_path = None
                     robot.last_goal = None
 
-            # Nav2 planned path (per-robot colour).
+            # Nav2 planned path (per-robot colour, black under-stroke for
+            # contrast against the light map).
             if robot.planner_path and len(robot.planner_path) >= 2:
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in robot.planner_path],
@@ -1299,8 +1302,9 @@ class LabRobotNode(Node):
                 colors = robot_colors.get(name, {})
                 dark = colors.get("path", (0, 0, 160))
                 bright = colors.get("path_bright", (0, 0, 255))
+                cv2.polylines(canvas, [pts], False, (0, 0, 0), 10, cv2.LINE_AA)
                 cv2.polylines(canvas, [pts], False, dark, 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, bright, 3, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, bright, 4, cv2.LINE_AA)
 
             # Goal marker (orange crosshair) at the last clicked point.
             if robot.last_goal is not None:
