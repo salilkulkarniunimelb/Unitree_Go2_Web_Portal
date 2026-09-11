@@ -114,6 +114,27 @@ FT_FRAME = "map"
 # tolerate AMCL noise and Nav2 stopping a little short of the exact point.
 GOAL_REACHED_TOLERANCE = 1.0
 
+# Per-robot visual identity. NOTE: cv2 draws BGR but Gradio displays RGB, so
+# these tuples equal the browser colours (channel 0 = red on screen).
+# Red = Luna, blue = Astro.
+ROBOT_COLORS = {
+    "Luna":  dict(fill=(255, 0, 0),  outline=(180, 0, 0),
+                  path_dark=(160, 0, 0),  path_bright=(255, 0, 0)),
+    "Astro": dict(fill=(0, 200, 255), outline=(0, 140, 200),
+                  path_dark=(0, 0, 160), path_bright=(0, 0, 255)),
+}
+
+
+def _draw_plan(canvas, pts, dark, bright):
+    """Draw the robot's planned route so it stands out against both the light
+    explored map and the dark walls: light casing -> black under-stroke ->
+    darker coloured outline -> bright coloured core (Luna red, Astro blue)."""
+    cv2.polylines(canvas, [pts], False, (250, 250, 250), 14, cv2.LINE_AA)
+    cv2.polylines(canvas, [pts], False, (0, 0, 0), 10, cv2.LINE_AA)
+    cv2.polylines(canvas, [pts], False, dark, 7, cv2.LINE_AA)
+    cv2.polylines(canvas, [pts], False, bright, 5, cv2.LINE_AA)
+
+
 SERV_NAME = "0.0.0.0"
 SERV_PORT = 7860
 
@@ -851,38 +872,28 @@ class RobotState:
 
         if self.robot_pose is not None:
             # Once the robot arrives at the goal, clear the plan + goal marker
-            # so the path disappears from the map. "Arrived" = the current pose
-            # is within tolerance, or it just passed the goal (overshoot).
+            # so the path disappears from the map. "Arrived" = the current
+            # map-frame pose is within tolerance of the goal. odom_path lives in
+            # the odom frame, so it must NOT be compared against the map-frame
+            # goal -- that frame mismatch could clear the route prematurely.
             if self.last_goal is not None:
                 gx, gy = self.last_goal
                 d_now = math.hypot(
                     self.robot_pose.position.x - gx,
                     self.robot_pose.position.y - gy,
                 )
-                near = d_now < GOAL_REACHED_TOLERANCE
-                if not near:
-                    for hx, hy in list(self.odom_path)[-6:]:
-                        if math.hypot(hx - gx, hy - gy) < GOAL_REACHED_TOLERANCE:
-                            near = True
-                            break
-                if near:
+                if d_now < GOAL_REACHED_TOLERANCE:
                     self.planner_path = None
                     self.last_goal = None
 
-            # Nav2 planned path (the route the robot is about to take).
-            # Color matches the robot: Luna = red, Astro = blue (same as its
-            # dot).  A black under-stroke provides contrast on the light map.
-            # NOTE: cv2 draws BGR but Gradio displays RGB, so these tuples
-            # equal the browser colours.
+            # Nav2 planned path (the route the robot is about to take). Color
+            # matches the robot: Luna = red, Astro = blue (same as its dot).
+            colors = ROBOT_COLORS[self.name]
             if self.planner_path and len(self.planner_path) >= 2:
-                path_dark = (160, 0, 0) if self.name == "Luna" else (0, 0, 160)
-                path_bright = (255, 0, 0) if self.name == "Luna" else (0, 0, 255)
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
                 )
-                cv2.polylines(canvas, [pts], False, (0, 0, 0), 10, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, path_dark, 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, path_bright, 4, cv2.LINE_AA)
+                _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
 
             # Goal marker (orange crosshair + dot) at the last clicked point.
             if self.last_goal is not None:
@@ -893,7 +904,7 @@ class RobotState:
                 cv2.line(canvas, (gx, gy - 14), (gx, gy + 14), (0, 165, 255), 2, cv2.LINE_AA)
 
             px, py = to_px(self.robot_pose.position.x, self.robot_pose.position.y)
-            dot = (255, 0, 0) if self.name == "Luna" else (0, 200, 255)
+            dot = colors["fill"]
             cv2.circle(canvas, (px, py), 10, dot, -1)
             ex = int(px + 30 * math.cos(self.yaw))
             ey = int(py - 30 * math.sin(self.yaw))
@@ -1262,49 +1273,32 @@ class LabRobotNode(Node):
             my = h - 1 - my
             return int(mx * scale) + pox, int(my * scale) + poy
 
-        # Per-robot visual identity. NOTE: cv2 draws BGR while Gradio displays
-        # RGB, so these tuples equal the browser colours. Red = Luna, blue = Astro.
-        robot_colors = {
-            "Luna":  dict(fill=(255, 0, 0),  outline=(180, 0, 0),
-                          path=(160, 0, 0),  path_bright=(255, 0, 0)),
-            "Astro": dict(fill=(0, 200, 255), outline=(0, 140, 200),
-                          path=(0, 0, 160), path_bright=(0, 0, 255)),
-        }
-
         # Draw each robot's plan + goal (same logic as single-robot draw_map).
         for name, robot in self.robots.items():
             if robot.robot_pose is None:
                 continue
-            # Goal-reached check: clears the plan so the path disappears.
+            colors = ROBOT_COLORS.get(name, ROBOT_COLORS["Luna"])
+            # Goal-reached check: clears the plan so the path disappears. Only
+            # the current map-frame pose is compared to the goal (odom_path is
+            # in the odom frame and must not be compared against it).
             if robot.last_goal is not None:
                 gx, gy = robot.last_goal
                 d_now = math.hypot(
                     robot.robot_pose.position.x - gx,
                     robot.robot_pose.position.y - gy,
                 )
-                near = d_now < GOAL_REACHED_TOLERANCE
-                if not near:
-                    for hx, hy in list(robot.odom_path)[-6:]:
-                        if math.hypot(hx - gx, hy - gy) < GOAL_REACHED_TOLERANCE:
-                            near = True
-                            break
-                if near:
+                if d_now < GOAL_REACHED_TOLERANCE:
                     robot.planner_path = None
                     robot.last_goal = None
 
-            # Nav2 planned path (per-robot colour, black under-stroke for
-            # contrast against the light map).
+            # Nav2 planned path (the route the robot is about to take), drawn in
+            # the robot's colour with a light casing + black under-stroke.
             if robot.planner_path and len(robot.planner_path) >= 2:
                 pts = np.array(
                     [to_px(wx, wy) for wx, wy in robot.planner_path],
                     dtype=np.int32,
                 )
-                colors = robot_colors.get(name, {})
-                dark = colors.get("path", (0, 0, 160))
-                bright = colors.get("path_bright", (0, 0, 255))
-                cv2.polylines(canvas, [pts], False, (0, 0, 0), 10, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, dark, 7, cv2.LINE_AA)
-                cv2.polylines(canvas, [pts], False, bright, 4, cv2.LINE_AA)
+                _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
 
             # Goal marker (orange crosshair) at the last clicked point.
             if robot.last_goal is not None:
@@ -1316,7 +1310,6 @@ class LabRobotNode(Node):
                 cv2.line(canvas, (gx, gy - 14), (gx, gy + 14),
                          (0, 165, 255), 2, cv2.LINE_AA)
 
-            colors = robot_colors.get(name, {})
             fill = colors.get("fill", (255, 0, 0))
             outline = colors.get("outline", (180, 0, 0))
             px, py = to_px(robot.robot_pose.position.x, robot.robot_pose.position.y)
@@ -1476,7 +1469,7 @@ def main():
                             init_bridge = gr.Textbox(visible=True, show_label=False,
                                                      elem_id="initpose_bridge", scale=0)
 
-                        gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path (clears on arrival)** · **orange target = goal** · blue = explored · dark = walls")
+                        gr.Markdown("**Legend:** 🔴 **Luna** (red dot · red route) · 🟦 **Astro** (blue dot · blue route) · black arrow = heading · **orange target = goal (route clears on arrival)** · blue = explored · dark = walls")
 
                         with gr.Group():
                             gr.Markdown("#### FUTURE: 3D VIEW")
@@ -1617,9 +1610,9 @@ def main():
                             label="Occupancy Map — both robots · click to set a nav goal",
                             type="numpy", elem_id="patrol_map_image", height=520)
                         gr.Markdown(
-                            "**Legend:** 🔴 **Luna** (red dot, red path) · "
-                            "🟦 **Astro** (blue dot, blue path) — black arrow = heading · "
-                            "**orange target = goal (clears on arrival)**")
+                            "**Legend:** 🔴 **Luna** (red dot, red route) · "
+                            "🟦 **Astro** (blue dot, blue route) — black arrow = heading · "
+                            "**orange target = goal (route clears on arrival)**")
 
                     # RIGHT: Fleet Camera — streams from BOTH robots
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
