@@ -199,18 +199,7 @@ DASHBOARD_CSS = """
         border:1px solid var(--block-border-color) !important;
         border-radius:12px !important;padding:12px !important;}
 
-    /* Workflow stepper */
-    .workflow-stepper{display:flex;align-items:center;gap:8px;
-        background:var(--block-background-fill);border:1px solid var(--block-border-color);
-        border-radius:12px;padding:12px 16px;margin-bottom:10px;flex-wrap:wrap;}
-    .step{display:flex;align-items:center;gap:8px;
-        font-size:13px;color:var(--body-text-color-subdued);}
-    .step.active{color:var(--color-accent);font-weight:600;}
-    .step .step-num{width:22px;height:22px;border-radius:50%;
-        background:var(--border-color-primary);display:flex;align-items:center;
-        justify-content:center;font-size:11px;color:var(--color-accent);}
-    .step.active .step-num{background:var(--color-accent);color:var(--button-primary-text-color, #fff);}
-    .step-arrow{color:var(--border-color-primary);font-size:16px;}
+    
 
     /* Tab navigation — style gradio tabs to look like nav buttons */
     .tab-nav{display:flex;gap:6px !important;margin-bottom:10px !important;padding:6px !important;
@@ -1397,17 +1386,6 @@ def main():
             <div class="title">5G-Enabled Multi-Agent Mission Dashboard</div>
             <div class="subtitle">E-12-DMAT-025 · Luna &amp; Astro · live telemetry from the lab</div>
         </div>
-    </div>
-
-    <!-- Workflow stepper (future steps, mission-type dependent) -->
-    <div class="workflow-stepper">
-        <div class="step active"><span class="step-num">1</span>mapping <small>Build the environment</small></div>
-        <span class="step-arrow">&#8594;</span>
-        <div class="step active"><span class="step-num">2</span>patrolling <small>Fleet overview &amp; goal routing</small></div>
-        <span class="step-arrow">&#8594;</span>
-        <div class="step"><span class="step-num">3</span>scenario <small>Choose mission type</small></div>
-        <span class="step-arrow">&#8594;</span>
-        <div class="step"><span class="step-num">4</span>operations <small>Run the mission</small></div>
     </div>
     """
 
