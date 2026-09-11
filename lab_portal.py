@@ -38,6 +38,8 @@ Usage:
 
 import math
 import queue
+import json
+import subprocess
 import threading
 import time
 import base64
@@ -61,22 +63,24 @@ LUNA_TOPICS = {
     "map":     "/luna/lidar_slam_2d_map",
     "pose":    "/luna/amcl_pose",
     "odom":    "/luna/go2/restamped/robot_odom",
-    "camera":  "/luna/frontvideostream",
+    "camera":  "/luna/frontvideostream/h264",
     "battery": "/lf/lowstate",
     "goal":    "/luna/goal_pose",
     "initialpose": "/luna/initialpose",
     "plan":    "/luna/plan",
+    "plan_patrol": "/luna/patrol/checkpoint_plan",
 }
 
 ASTRO_TOPICS = {
     "map":     "/astro/lidar_slam_2d_map",
     "pose":    "/astro/amcl_pose",
     "odom":    "/astro/go2/restamped/robot_odom",
-    "camera":  "/astro/frontvideostream",
+    "camera":  "/astro/frontvideostream/h264",
     "battery": "/lf/lowstate",
     "goal":    "/astro/goal_pose",
     "initialpose": "/astro/initialpose",
     "plan":    "/astro/plan",
+    "plan_patrol": "/astro/patrol/checkpoint_plan",
 }
 
 ROBOTS = {
@@ -84,20 +88,19 @@ ROBOTS = {
     "Astro": ASTRO_TOPICS,
 }
 
-# Luna's camera is H.264-encoded Go2FrontVideoData. We decode it with a
-# persistent ffmpeg pipeline (started once per robot) fed via stdin and read
-# Camera frames arrive as raw H.264 Go2FrontVideoData, fragmented across many
-# small ROS messages. A persistent ffmpeg pipe cannot stay in sync on this
-# stream, so we buffer bytes and decode the newest SPS-keyframe window from a
-# file on a background thread. ffmpeg must be installed in the container.
+# Cameras publish H.264 (Annex B) via foxglove_msgs/msg/CompressedVideo on
+# /luna|astro/frontvideostream/h264 -- each message carries enough NAL units to
+# decode exactly one frame (keyframes also include their SPS). We buffer the
+# bytes and decode the newest SPS-keyframe window from a file on a background
+# thread, so the stream stays decodable without a persistent ffmpeg pipe.
 CAM_W, CAM_H, CAM_BUFFER_MAX = 640, 360, 6 * 1024 * 1024
 # Ignore the buffer until it holds at least this much data (enough for a
 # keyframe sequence) -- avoids decoding a nearly-empty, undecodable buffer.
 CAM_MIN_BYTES = 512 * 1024
 # Background decode cadence (s). Governs how often a new batch is decoded.
-# The Go2 source streams ~260 tiny H.264 fragments/s of only ~7 distinct display
-# frames/s, so decoding faster than 0.4s only re-produces duplicate frames and
-# costs CPU without raising the visible fps (which is source-limited).
+# The H.264 source emits many frames/s but only ~7 distinct display frames/s,
+# so decoding faster than 0.4s only re-produces duplicate frames and costs CPU
+# without raising the visible fps (which is source-limited).
 CAM_DECODE_INTERVAL = 0.4
 # Max frames to cache for smooth playback (one shot of motion per refill).
 CAM_FRAMES_MAX = 20
@@ -142,10 +145,11 @@ SERV_PORT = 7860
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 try:
     from cv_bridge import CvBridge
@@ -158,9 +162,9 @@ except Exception:
     LowState = None
 
 try:
-    from unitree_go.msg import Go2FrontVideoData
+    from foxglove_msgs.msg import CompressedVideo
 except Exception:
-    Go2FrontVideoData = None
+    CompressedVideo = None
 
 
 def _placeholder(w, h, text, color=(56, 189, 248)):
@@ -477,6 +481,14 @@ class RobotState:
         #     /luna|astro/plan when a navigation goal is being executed) ---
         self.planner_path = None          # list of (wx, wy) in the "map" frame
         self.planner_path_stamp = 0.0
+        # --- Patrol planned path (the lab's actual route to display). The
+        #     hivemind patrol autonomy publishes the frozen checkpoint route
+        #     as a JSON string on /luna|astro/patrol/checkpoint_plan with
+        #     schema stage_b3_patrol_checkpoint_plan/v1; Nav2's /plan topic
+        #     carries nothing in this lab, so this is the path we draw. ---
+        self.patrol_path = None          # list of (wx, wy) in the "map" frame
+        self.patrol_path_stamp = 0.0
+        self.patrol_route_count = 0
         # --- initial pose (set via map drag) ---
         self.initial_pose = None          # (wx, wy, yaw) pending/confirmed initial pose
         self.last_initial = None
@@ -489,12 +501,11 @@ class RobotState:
         self._cam_frames = deque(maxlen=CAM_FRAMES_MAX)  # smooth-playback buffer
         self._last_decode = 0.0
         self._stop_cam = False
-        # Camera decode strategy: the Go2 H.264 stream is fragmented across many
-        # small ROS messages, so a persistent ffmpeg pipe can never stay in sync
-        # (constant "no frame!" / "non-existing PPS"). Instead we buffer bytes,
-        # trim the tail to the latest SPS keyframe sequence, and decode that
-        # window from a file on a background thread. Reliable, keeps the icon
-        # green, and delivers a live multi-fps camera.
+        # Camera decode strategy: the H.264 stream arrives as per-frame
+        # foxglove_msgs/msg/CompressedVideo messages, so we buffer the raw
+        # Annex-B bytes, trim the tail to the latest SPS keyframe sequence, and
+        # decode that window from a file on a background thread. Reliable, keeps
+        # the icon green, and delivers a live multi-fps camera.
         threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
         self.battery = None
@@ -515,12 +526,11 @@ class RobotState:
         self._cam_played_ts = time.time()
         self.cam_fps = 0.0
 
-        # Cached H.264 parameter sets (SPS + PPS). The Go2 stream only emits these
-        # once at startup, then continuous P-frames. The rolling buffer eventually
-        # scrolls past the SPS, leaving only reference P-frames that cannot decode
-        # on their own -> the camera "works a few moments then goes stale". We cache
-        # the SPS/PPS and prepend them to every decode window so the stream stays
-        # decodable forever.
+        # Cached H.264 parameter sets (SPS + PPS). Keyframes include their SPS,
+        # but once the rolling buffer scrolls past it only reference P-frames
+        # remain, which cannot decode on their own -> the camera could go stale.
+        # We cache the newest SPS/PPS and prepend them to every decode window so
+        # the stream stays decodable forever.
         self._sps = b""
         self._pps = b""
 
@@ -614,6 +624,53 @@ class RobotState:
         except Exception as e:
             self.node.get_logger().error(f"[{self.name}] plan_cb failed: {e}")
 
+    def patrol_plan_cb(self, msg):
+        """Store the lab's frozen patrol route from /luna|astro/patrol/checkpoint_plan.
+
+        The hivemind edge_patrol_autonomy_bridge publishes the route each mission
+        as a JSON string (schema stage_b3_patrol_checkpoint_plan/v1) with
+        checkpoints [{x_m, y_m, yaw_rad}...] in the "map" frame, and a cleared
+        (empty) plan once the mission ends. This is the planned path that is
+        actually followed in the lab, so we draw it in the robot's colour."""
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                return
+            if data.get("schema") != "stage_b3_patrol_checkpoint_plan/v1":
+                return
+            checkpoints = data.get("checkpoints") or []
+            if not isinstance(checkpoints, list) or not checkpoints:
+                self.patrol_path = None
+                self.patrol_route_count = 0
+                return
+            path = [
+                (float(c["x_m"]), float(c["y_m"]))
+                for c in checkpoints
+                if isinstance(c, dict)
+            ]
+            self.patrol_path = path or None
+            self.patrol_path_stamp = self.node.get_clock().now().nanoseconds / 1e9
+            self.patrol_route_count = len(path)
+            self.node.get_logger().info(
+                f"[{self.name}] patrol route {data.get('plan_id', '?')}: "
+                f"{len(path)} checkpoints"
+            )
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.name}] patrol_plan_cb failed: {e}")
+
+    def display_route(self):
+        """The route to draw now: prefer the lab patrol route (the frozen
+        checkpoint plan that is actually followed), else Nav2's /plan path."""
+        if self.patrol_path and len(self.patrol_path) >= 2:
+            return self.patrol_path
+        if self.planner_path and len(self.planner_path) >= 2:
+            return self.planner_path
+        return None
+
+    def clear_routes(self):
+        self.patrol_path = None
+        self.planner_path = None
+
     @staticmethod
     def _nal_units(raw):
         """Yield (offset, start_code_size) for each Annex-B start code in raw."""
@@ -648,8 +705,8 @@ class RobotState:
                 self._pps = raw[pos:end]
 
     def camera_cb(self, msg):
-        """Append H.264 bytes from Go2FrontVideoData to the rolling buffer and
-        cache SPS/PPS so the stream stays decodable as the buffer scrolls."""
+        """Append the H.264 bytes from a CompressedVideo frame to the rolling
+        buffer and cache SPS/PPS so the stream stays decodable as it scrolls."""
         try:
             data = bytes(msg.data)
             with self._cam_lock:
@@ -793,13 +850,25 @@ class RobotState:
         if len(raw) < CAM_MIN_BYTES:
             return []
 
+        def sps_at_start(r):
+            i = 0
+            if r.startswith(b"\x00\x00\x00\x01"):
+                i = 4
+            elif r.startswith(b"\x00\x00\x01"):
+                i = 3
+            else:
+                return False
+            return i < len(r) and r[i] & 0x1F == 7
+
         def assemble(s, p):
             r = self._trim_to_keyframe(raw)
             if r is None:
                 return None
-            if s:
-                # Prepend the (refreshed) parameter sets so the decoder always
-                # has them, even after the keyframe scrolled out of the buffer.
+            if s and not sps_at_start(r):
+                # Prepend the (refreshed) parameter sets only when the trimmed
+                # segment does not already start with its own SPS, so the
+                # decoder always has a valid reference without a stale leading
+                # parameter set before a fresh one.
                 return s + p + r
             return r
 
@@ -822,22 +891,31 @@ class RobotState:
 
     def _decode_segment(self, raw):
         """Write raw H.264 bytes to a temp file and decode up to CAM_FRAMES_MAX
-        frames. Returns [] on failure so callers can trigger self-healing."""
+        frames. OpenCV 4.11's VideoCapture raises a 'Mat _step >= minstep'
+        assertion on this H.264 stream (a known OpenCV H.264 quirk), so we decode
+        with a short-lived ffmpeg process instead: scale in-stream to the camera
+        size and read back raw BGR frames. Returns [] on failure so callers can
+        trigger self-healing."""
         tmp = f"/tmp/{self.name}_cam.h264"
         with open(tmp, "wb") as f:
             f.write(raw)
-        cap = cv2.VideoCapture(tmp)
-        frames = []
-        while len(frames) < CAM_FRAMES_MAX:
-            ret, f = cap.read()
-            if not ret:
-                break
-            h, w = f.shape[:2]
-            if w > CAM_W or h > CAM_H:
-                f = cv2.resize(f, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
-            frames.append(f)
-        cap.release()
-        return frames
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-i", tmp,
+                 "-vf", f"scale={CAM_W}:{CAM_H}", "-r", "24",
+                 "-f", "rawvideo", "-pix_fmt", "bgr24",
+                 "-frames:v", str(CAM_FRAMES_MAX), "-"],
+                capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.name}] ffmpeg decode crashed: {e}")
+            return []
+        data = proc.stdout
+        fs = CAM_W * CAM_H * 3
+        return [
+            np.frombuffer(data[i:i + fs], dtype=np.uint8).reshape(CAM_H, CAM_W, 3)
+            for i in range(0, len(data) - fs + 1, fs)
+        ]
 
     def decode_camera(self):
         """Return the latest decoded frame instantly (decode runs in a thread).
@@ -883,15 +961,17 @@ class RobotState:
                     self.robot_pose.position.y - gy,
                 )
                 if d_now < GOAL_REACHED_TOLERANCE:
-                    self.planner_path = None
+                    self.clear_routes()
                     self.last_goal = None
 
-            # Nav2 planned path (the route the robot is about to take). Color
-            # matches the robot: Luna = red, Astro = blue (same as its dot).
+            # The route the robot is about to take (patrol checkpoint plan or
+            # Nav2 /plan). Color matches the robot: Luna = red, Astro = blue
+            # (same as its dot).
             colors = ROBOT_COLORS[self.name]
-            if self.planner_path and len(self.planner_path) >= 2:
+            route = self.display_route()
+            if route is not None:
                 pts = np.array(
-                    [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
+                    [to_px(wx, wy) for wx, wy in route], dtype=np.int32
                 )
                 _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
 
@@ -1118,21 +1198,42 @@ class LabRobotNode(Node):
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
             # Nav2's global planner publishes the path currently being followed
             # on /luna|astro/plan; draw it on the map so the operator can see the
-            # route the robot is about to take before/while it drives.
-            self.create_subscription(Path, topics["plan"], robot.plan_cb, 10)
-            if Go2FrontVideoData is not None:
-                # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
-                # RELIABLE depth-10 subscription drops messages under the burst
-                # load, which slices gaps into the H.264 stream and makes it
-                # impossible to decode any frame. Use BEST_EFFORT + a deep
-                # history so the newest contiguous bytes arrive without gap.
+            # route the robot is about to take before/while it drives. Use the
+            # same explicit RELIABLE/VOLATILE/KEEP_LAST(10) QoS the plan watcher
+            # uses so every published plan is delivered consistently.
+            plan_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(Path, topics["plan"], robot.plan_cb,
+                                     qos_profile=plan_qos)
+            # The lab's actual route lives on /luna|astro/patrol/checkpoint_plan,
+            # published as a latched JSON string (stage_b3_patrol_checkpoint_plan/v1)
+            # by edge_patrol_autonomy_bridge. Subscribe TRANSIENT_LOCAL so the
+            # currently-latched route is delivered as soon as we start, and draw
+            # the checkpoint polyline as the planned path on the map.
+            patrol_plan_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(String, topics["plan_patrol"],
+                                     robot.patrol_plan_cb,
+                                     qos_profile=patrol_plan_qos)
+            if CompressedVideo is not None:
+                # Each CompressedVideo message carries a complete H.264 frame
+                # (Annex B), so a lost message only skips a frame -- BEST_EFFORT
+                # with a deep history avoids backpressure dropping whole frames.
                 cam_qos = QoSProfile(
                     depth=100,
                     reliability=ReliabilityPolicy.BEST_EFFORT,
                     durability=DurabilityPolicy.VOLATILE,
                 )
                 self.create_subscription(
-                    Go2FrontVideoData, topics["camera"], robot.camera_cb,
+                    CompressedVideo, topics["camera"], robot.camera_cb,
                     qos_profile=cam_qos,
                 )
             if LowState is not None:
@@ -1144,7 +1245,8 @@ class LabRobotNode(Node):
             self.robots[name] = robot
             self.get_logger().info(
                 f"[{name}] Subscribed to {topics['map']}, {topics['pose']}, "
-                f"{topics['odom']}, {topics['camera']}, {topics['battery']}"
+                f"{topics['odom']}, {topics['camera']}, {topics['battery']}, "
+                f"{topics['plan']}, {topics['plan_patrol']}"
             )
 
         self.current = "Luna"
@@ -1165,6 +1267,9 @@ class LabRobotNode(Node):
                     self.get_logger().info(
                         f"[DIAG] {name}: map={robot.cached_map_img is not None} "
                         f"pose={'y' if robot.robot_pose is not None else 'n'} "
+                        f"route={'y' if robot.display_route() is not None else 'n'} "
+                        f"patrol_pts={len(robot.patrol_path) if robot.patrol_path else 0} "
+                        f"nav2_pts={len(robot.planner_path) if robot.planner_path else 0} "
                         f"pose_txt={robot.pose_latest!r} cam_frame={'y' if robot.color_frame is not None else 'n'} "
                         f"cam_ts={robot.cam_frame_ts:.1f} cam_fps={robot.cam_fps:.2f}"
                     )
@@ -1288,14 +1393,16 @@ class LabRobotNode(Node):
                     robot.robot_pose.position.y - gy,
                 )
                 if d_now < GOAL_REACHED_TOLERANCE:
-                    robot.planner_path = None
+                    robot.clear_routes()
                     robot.last_goal = None
 
-            # Nav2 planned path (the route the robot is about to take), drawn in
-            # the robot's colour with a light casing + black under-stroke.
-            if robot.planner_path and len(robot.planner_path) >= 2:
+            # The route the robot is about to take (patrol checkpoint plan or
+            # Nav2 /plan), drawn in the robot's colour with a light casing +
+            # black under-stroke.
+            route = robot.display_route()
+            if route is not None:
                 pts = np.array(
-                    [to_px(wx, wy) for wx, wy in robot.planner_path],
+                    [to_px(wx, wy) for wx, wy in route],
                     dtype=np.int32,
                 )
                 _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
