@@ -212,6 +212,17 @@ DASHBOARD_CSS = """
     .step.active .step-num{background:var(--color-accent);color:var(--button-primary-text-color, #fff);}
     .step-arrow{color:var(--border-color-primary);font-size:16px;}
 
+    /* Tab navigation — style gradio tabs to look like nav buttons */
+    .tab-nav{display:flex;gap:6px !important;margin-bottom:10px !important;padding:6px !important;
+        background:var(--block-background-fill);border:1px solid var(--block-border-color);
+        border-radius:12px;}
+    .tab-nav button{border-radius:10px !important;font-weight:600 !important;
+        padding:10px 24px !important;font-size:14px !important;
+        transition:all 0.2s ease !important;}
+    .tab-nav button.selected{background:var(--color-accent) !important;
+        color:var(--button-primary-text-color, #fff) !important;
+        border-color:var(--color-accent) !important;}
+
     /* Robot fleet */
     .fleet-panel{display:flex;flex-direction:column;gap:10px;}
     .robot-card{background:var(--block-background-fill);border:1px solid var(--block-border-color);
@@ -1129,6 +1140,7 @@ class LabRobotNode(Node):
             )
 
         self.current = "Luna"
+        self.patrol_robot = "Luna"
 
         # Publish goals from a dedicated thread. rclpy publish() must NOT be
         # called from a Gradio/anyio worker thread (it can corrupt the rclpy
@@ -1222,6 +1234,145 @@ class LabRobotNode(Node):
     def drag_to_initial(self, press, release):
         return self.current_robot.drag_to_initial(press, release)
 
+    # ---- patrolling page ----
+    def set_patrol_robot(self, name):
+        if name in self.robots:
+            self.patrol_robot = name
+            return f"Patrol goal target: {name}"
+        return f"Unknown robot: {name}"
+
+    def draw_patrol_map(self):
+        """Render both robots, their paths and goals on a single occupancy
+        grid.  The base map is taken from whichever robot has a live occupancy
+        grid; every robot's pose, Nav2 plan and goal marker are overlaid."""
+        # Pick the base map from whichever robot has one.
+        base = None
+        label_positions = []
+        for r in self.robots.values():
+            if r.cached_map_img is not None:
+                base = r
+                break
+        if base is None:
+            return _placeholder(640, 480, "WAITING FOR MAP DATA...")
+
+        canvas = base.cached_map_img.copy()
+        scale = base.cached_scale
+        ox, oy, h, pox, poy, res = base.cached_meta
+
+        def to_px(wx, wy):
+            mx = (wx - ox) / res
+            my = (wy - oy) / res
+            my = h - 1 - my
+            return int(mx * scale) + pox, int(my * scale) + poy
+
+        # Per-robot visual identity. NOTE: cv2 draws BGR while Gradio displays
+        # RGB, so these tuples equal the browser colours. Red = Luna, blue = Astro.
+        robot_colors = {
+            "Luna":  dict(fill=(255, 0, 0),  outline=(180, 0, 0),
+                          path=(0, 0, 220),  path_bright=(0, 0, 255)),
+            "Astro": dict(fill=(0, 200, 255), outline=(0, 140, 200),
+                          path=(200, 120, 0), path_bright=(255, 160, 0)),
+        }
+
+        # Draw each robot's plan + goal (same logic as single-robot draw_map).
+        for name, robot in self.robots.items():
+            if robot.robot_pose is None:
+                continue
+            # Goal-reached check: clears the plan so the path disappears.
+            if robot.last_goal is not None:
+                gx, gy = robot.last_goal
+                d_now = math.hypot(
+                    robot.robot_pose.position.x - gx,
+                    robot.robot_pose.position.y - gy,
+                )
+                near = d_now < GOAL_REACHED_TOLERANCE
+                if not near:
+                    for hx, hy in list(robot.odom_path)[-6:]:
+                        if math.hypot(hx - gx, hy - gy) < GOAL_REACHED_TOLERANCE:
+                            near = True
+                            break
+                if near:
+                    robot.planner_path = None
+                    robot.last_goal = None
+
+            # Nav2 planned path (per-robot colour).
+            if robot.planner_path and len(robot.planner_path) >= 2:
+                pts = np.array(
+                    [to_px(wx, wy) for wx, wy in robot.planner_path],
+                    dtype=np.int32,
+                )
+                colors = robot_colors.get(name, {})
+                dark = colors.get("path", (0, 0, 160))
+                bright = colors.get("path_bright", (0, 0, 255))
+                cv2.polylines(canvas, [pts], False, dark, 7, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, bright, 3, cv2.LINE_AA)
+
+            # Goal marker (orange crosshair) at the last clicked point.
+            if robot.last_goal is not None:
+                gx, gy = to_px(*robot.last_goal)
+                cv2.circle(canvas, (gx, gy), 9, (0, 165, 255), 3, cv2.LINE_AA)
+                cv2.circle(canvas, (gx, gy), 3, (0, 165, 255), -1, cv2.LINE_AA)
+                cv2.line(canvas, (gx - 14, gy), (gx + 14, gy),
+                         (0, 165, 255), 2, cv2.LINE_AA)
+                cv2.line(canvas, (gx, gy - 14), (gx, gy + 14),
+                         (0, 165, 255), 2, cv2.LINE_AA)
+
+            colors = robot_colors.get(name, {})
+            fill = colors.get("fill", (255, 0, 0))
+            outline = colors.get("outline", (180, 0, 0))
+            px, py = to_px(robot.robot_pose.position.x, robot.robot_pose.position.y)
+            cv2.circle(canvas, (px, py), 10, fill, -1)
+            cv2.circle(canvas, (px, py), 10, outline, 2)
+            ex = int(px + 30 * math.cos(robot.yaw))
+            ey = int(py - 30 * math.sin(robot.yaw))
+            cv2.arrowedLine(canvas, (px, py), (ex, ey), (0, 0, 0), 3)
+            label_positions.append((px, py, name))
+
+        canvas = cv2.rotate(canvas, cv2.ROTATE_90_CLOCKWISE)
+        hc, wc = canvas.shape[:2]
+
+        # Robot labels.
+        for px, py, name in label_positions:
+            # 90-degree CW rotation: dst(row = src_col, col = H-1-src_row).
+            # Source row = py, col = px -> dst col = H-1-py, dst row = px.
+            # cv2.putText's (x, y) is (col, baseline-row).
+            lx = wc - 1 - py + 5
+            ly = px - 5
+            cv2.putText(canvas, name, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.putText(canvas, name, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.putText(canvas, "N", (wc // 2, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 0), 2)
+        cv2.putText(canvas, "S", (wc // 2, hc - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 0), 2)
+
+        return canvas
+
+    def patrol_click_to_goal(self, evt: gr.SelectData):
+        """Forward a map click on the patrol page to the patrol-selected robot."""
+        robot = self.robots.get(self.patrol_robot)
+        if robot is None:
+            return "No robot selected for patrol"
+        return robot.click_to_goal(evt)
+
+    def patrol_draw_camera(self):
+        robot = self.robots.get(self.patrol_robot)
+        if robot is None:
+            return _placeholder(640, 360, "SELECT A ROBOT")
+        return robot.draw_camera()
+
+    def patrol_get_status(self):
+        robot = self.robots.get(self.patrol_robot)
+        if robot is None:
+            return ("No robot", "—", "—")
+        return (
+            robot.get_connection_status(),
+            robot.get_pose_data(),
+            f"{robot.cam_fps:.1f} fps",
+        )
+
 
 def main():
     rclpy.init(args=None)
@@ -1252,9 +1403,9 @@ def main():
     <div class="workflow-stepper">
         <div class="step active"><span class="step-num">1</span>mapping <small>Build the environment</small></div>
         <span class="step-arrow">&#8594;</span>
-        <div class="step"><span class="step-num">2</span>scenario <small>Choose mission type</small></div>
+        <div class="step active"><span class="step-num">2</span>patrolling <small>Fleet overview &amp; goal routing</small></div>
         <span class="step-arrow">&#8594;</span>
-        <div class="step"><span class="step-num">3</span>localisation <small>Place required robots</small></div>
+        <div class="step"><span class="step-num">3</span>scenario <small>Choose mission type</small></div>
         <span class="step-arrow">&#8594;</span>
         <div class="step"><span class="step-num">4</span>operations <small>Run the mission</small></div>
     </div>
@@ -1263,184 +1414,272 @@ def main():
     with gr.Blocks(title="5G-Enabled Multi-Agent Mission Dashboard", theme=theme, css=DASHBOARD_CSS, head=INIT_POSE_JS) as demo:
         gr.HTML(header_html)
 
-        # ================================================================
-        # TOP ROW: ROBOT FLEET (LEFT) + MAP (CENTER) + CAMERA (RIGHT)
-        # ================================================================
-        with gr.Row():
-            # ---------- LEFT: ROBOT FLEET ----------
-            with gr.Column(scale=1, elem_classes=["fleet-panel"]):
-                gr.Markdown("#### ROBOT FLEET")
-                robot_dd = gr.Dropdown(
-                    choices=list(ROBOTS.keys()),
-                    value=node.current,
-                    label="Select Robot",
-                    interactive=True,
-                    elem_classes=["robot-selector"],
-                )
+        with gr.Tabs() as page_tabs:
+            # ================================================================
+            # TAB 1: MAPPING (existing single-robot dashboard)
+            # ================================================================
+            with gr.Tab("1 Mapping", id="mapping"):
 
-                # Luna card
-                with gr.Group(elem_classes=["robot-card"]):
-                    with gr.Row():
-                        gr.Markdown("### Luna")
-                        gr.Markdown("🟢 Connected")
-                    luna_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
-                    luna_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
-                    luna_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
-
-                # Astro card
-                with gr.Group(elem_classes=["robot-card"]):
-                    with gr.Row():
-                        gr.Markdown("### Astro")
-                        gr.Markdown("🟢 Connected")
-                    astro_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
-                    astro_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
-                    astro_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
-
-                gr.Markdown("#### FUTURE: MISSION CONTROLS")
-                with gr.Group(elem_classes=["mission-buttons"]):
-                    with gr.Row():
-                        gr.Button("🎯 Start Mapping", interactive=False)
-                    with gr.Row():
-                        gr.Button("🚀 Start Mission", interactive=False)
-                        gr.Button("⏹ Stop", interactive=False)
-
-            # ---------- CENTER: LIVE 3D MAPPING ----------
-            with gr.Column(scale=2, elem_classes=["map-panel"]):
-                gr.Markdown("## Live Mapping")
-
-                init_toggle = gr.Checkbox(
-                    label="Set Initial Pose — drag on the map (position = start, "
-                          "orientation = drag direction)",
-                    value=False,
-                    elem_id="initpose_toggle",
-                )
-
-                map_img = gr.Image(label="Occupancy Map — click to set a nav goal",
-                                   type="numpy", elem_id="map_image", height=520)
-                goal_out = gr.Textbox(label="Goal Status", lines=1)
-
+                # ================================================================
+                # TOP ROW: ROBOT FLEET (LEFT) + MAP (CENTER) + CAMERA (RIGHT)
+                # ================================================================
                 with gr.Row():
-                    init_status = gr.Textbox(label="🟢 Initial Pose Status", lines=1,
-                                             interactive=False, scale=2)
-                    init_bridge = gr.Textbox(visible=True, show_label=False,
-                                             elem_id="initpose_bridge", scale=0)
+                    # ---------- LEFT: ROBOT FLEET ----------
+                    with gr.Column(scale=1, elem_classes=["fleet-panel"]):
+                        gr.Markdown("#### ROBOT FLEET")
+                        robot_dd = gr.Dropdown(
+                            choices=list(ROBOTS.keys()),
+                            value=node.current,
+                            label="Select Robot",
+                            interactive=True,
+                            elem_classes=["robot-selector"],
+                        )
 
-                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path (clears on arrival)** · **orange target = goal** · blue = explored · dark = walls")
+                        # Luna card
+                        with gr.Group(elem_classes=["robot-card"]):
+                            with gr.Row():
+                                gr.Markdown("### Luna")
+                                gr.Markdown("🟢 Connected")
+                            luna_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
+                            luna_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
+                            luna_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
 
-                with gr.Group():
-                    gr.Markdown("#### FUTURE: 3D VIEW")
-                    gr.Textbox(label="3D Foxglove Panel (port 8765)", value="Awaiting ROS gateway...",
-                               lines=1, interactive=False)
+                        # Astro card
+                        with gr.Group(elem_classes=["robot-card"]):
+                            with gr.Row():
+                                gr.Markdown("### Astro")
+                                gr.Markdown("🟢 Connected")
+                            astro_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
+                            astro_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
+                            astro_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
 
-            # ---------- RIGHT: LIVE CAMERA ----------
-            with gr.Column(scale=1, elem_classes=["camera-panel"]):
-                gr.Markdown("## Live Camera")
-                cam_img = gr.Image(label="Forward Camera — selected robot",
-                                   type="numpy", height=300)
-                cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
-                gr.Markdown("#### FUTURE: ADDITIONAL VIEWS")
-                with gr.Group():
-                    with gr.Row():
-                        gr.Button("📷 Depth", interactive=False)
-                        gr.Button("🎨 Color", interactive=False)
-                        gr.Button("🔍 YOLO", interactive=False)
-                with gr.Group():
-                    gr.Textbox(label="RealSense Depth", value="Awaiting stream...",
-                               lines=1, interactive=False)
-                    gr.Textbox(label="RealSense Color", value="Awaiting stream...",
-                               lines=1, interactive=False)
-                    gr.Textbox(label="YOLO Detections", value="Awaiting stream...",
-                               lines=1, interactive=False)
+                        gr.Markdown("#### FUTURE: MISSION CONTROLS")
+                        with gr.Group(elem_classes=["mission-buttons"]):
+                            with gr.Row():
+                                gr.Button("🎯 Start Mapping", interactive=False)
+                            with gr.Row():
+                                gr.Button("🚀 Start Mission", interactive=False)
+                                gr.Button("⏹ Stop", interactive=False)
 
-        # ================================================================
-        # BOTTOM ROW: TELEMETRY + STATUS FOOTER
-        # ================================================================
-        with gr.Row():
-            with gr.Column():
-                battery_out = gr.Textbox(label="🔋 Battery", lines=2)
-                orient_out = gr.Textbox(label="📐 Orientation", lines=2)
-            with gr.Column():
-                pose_out = gr.Textbox(label="📍 Pose", lines=2)
-                motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=3)
+                    # ---------- CENTER: LIVE 3D MAPPING ----------
+                    with gr.Column(scale=2, elem_classes=["map-panel"]):
+                        gr.Markdown("## Live Mapping")
 
-        conn_out = gr.Textbox(label="Connection Status", lines=2, interactive=False)
+                        init_toggle = gr.Checkbox(
+                            label="Set Initial Pose — drag on the map (position = start, "
+                                  "orientation = drag direction)",
+                            value=False,
+                            elem_id="initpose_toggle",
+                        )
 
-        # --- tickers (each independently safe; missing data => placeholder) ---
-        # Map is redrawn at 2 Hz: a full occupancy-grid image shipped to the
-        # browser on every tick is the largest CPU/bandwidth driver. Slowing it
-        # to 0.5s frees CPU so the camera stream (below) can refresh smoothly
-        # instead of being starved by a 10 Hz map redraw.
-        map_timer = gr.Timer(0.5)
-        map_timer.tick(lambda: node.draw_map(), outputs=map_img)
+                        map_img = gr.Image(label="Occupancy Map — click to set a nav goal",
+                                           type="numpy", elem_id="map_image", height=520)
+                        goal_out = gr.Textbox(label="Goal Status", lines=1)
 
-        # Camera pulls decoded frames faster than before. Frames are produced by
-        # a background decode thread, so a quick 0.1s pull yields fluid playback
-        # without adding decode work -- it just drains the ready frame queue.
-        cam_timer = gr.Timer(0.1)
-        cam_timer.tick(lambda: node.draw_camera(), outputs=cam_img)
+                        with gr.Row():
+                            init_status = gr.Textbox(label="🟢 Initial Pose Status", lines=1,
+                                                     interactive=False, scale=2)
+                            init_bridge = gr.Textbox(visible=True, show_label=False,
+                                                     elem_id="initpose_bridge", scale=0)
 
-        status_timer = gr.Timer(1.0)
-        status_timer.tick(
-            lambda: (
-                node.get_connection_status(),
-                node.get_battery_data(),
-                node.get_motor_data(),
-                node.get_orientation_data(),
-                node.get_pose_data(),
-                f"{node.current_robot.cam_fps:.1f} fps",
-            ),
-            outputs=[conn_out, battery_out, motor_out, orient_out, pose_out, cam_fps_out],
-        )
+                        gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path (clears on arrival)** · **orange target = goal** · blue = explored · dark = walls")
 
-        # Populate per-robot status cards
-        robot_status_timer = gr.Timer(2.0)
+                        with gr.Group():
+                            gr.Markdown("#### FUTURE: 3D VIEW")
+                            gr.Textbox(label="3D Foxglove Panel (port 8765)", value="Awaiting ROS gateway...",
+                                       lines=1, interactive=False)
 
-        def robot_status():
-            texts = []
-            for name in node.robots:
-                robot = node.robots[name]
-                now = node.get_clock().now().nanoseconds / 1e9
-                map_ok = "🟢 live" if robot.map_stamp > 0 and now - robot.map_stamp < 5.0 else ("🟡 stale" if robot.map_stamp > 0 else "⚪ waiting")
-                pose_ok = "🟢 live" if robot.robot_pose is not None else "⚪ waiting"
-                cam_ok = "🟢 live" if robot.cam_fps > 0.5 else "⚪ waiting"
-                texts.append(map_ok)
-                texts.append(pose_ok)
-                texts.append(cam_ok)
-            return texts
+                    # ---------- RIGHT: LIVE CAMERA ----------
+                    with gr.Column(scale=1, elem_classes=["camera-panel"]):
+                        gr.Markdown("## Live Camera")
+                        cam_img = gr.Image(label="Forward Camera — selected robot",
+                                           type="numpy", height=300)
+                        cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
+                        gr.Markdown("#### FUTURE: ADDITIONAL VIEWS")
+                        with gr.Group():
+                            with gr.Row():
+                                gr.Button("📷 Depth", interactive=False)
+                                gr.Button("🎨 Color", interactive=False)
+                                gr.Button("🔍 YOLO", interactive=False)
+                        with gr.Group():
+                            gr.Textbox(label="RealSense Depth", value="Awaiting stream...",
+                                       lines=1, interactive=False)
+                            gr.Textbox(label="RealSense Color", value="Awaiting stream...",
+                                       lines=1, interactive=False)
+                            gr.Textbox(label="YOLO Detections", value="Awaiting stream...",
+                                       lines=1, interactive=False)
 
-        robot_status_timer.tick(
-            robot_status,
-            outputs=[luna_map_status, luna_pose_status, luna_cam_status,
-                     astro_map_status, astro_pose_status, astro_cam_status],
-        )
+                # ================================================================
+                # BOTTOM ROW: TELEMETRY + STATUS FOOTER
+                # ================================================================
+                with gr.Row():
+                    with gr.Column():
+                        battery_out = gr.Textbox(label="🔋 Battery", lines=2)
+                        orient_out = gr.Textbox(label="📐 Orientation", lines=2)
+                    with gr.Column():
+                        pose_out = gr.Textbox(label="📍 Pose", lines=2)
+                        motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=3)
 
-        def on_map_select(mode, evt: gr.SelectData):
-            if mode:
-                return ("Initial Pose mode ON — press and drag on the map to "
-                        "set the initial pose (position + orientation).")
-            return node.click_to_goal(evt)
+                conn_out = gr.Textbox(label="Connection Status", lines=2, interactive=False)
 
-        def on_drag_payload(payload, mode):
-            if not mode:
-                return "Initial pose drag ignored — toggle \"Set Initial Pose\" ON."
-            if not payload or "," not in payload:
-                return "No drag data received."
-            try:
-                x1, y1, x2, y2 = [int(x) for x in payload.split(",")]
-            except Exception:
-                return f"Bad drag payload: {payload!r}"
-            return node.drag_to_initial((x1, y1), (x2, y2))
+                # --- tickers (each independently safe; missing data => placeholder) ---
+                # Map is redrawn at 2 Hz: a full occupancy-grid image shipped to the
+                # browser on every tick is the largest CPU/bandwidth driver. Slowing it
+                # to 0.5s frees CPU so the camera stream (below) can refresh smoothly
+                # instead of being starved by a 10 Hz map redraw.
+                map_timer = gr.Timer(0.5)
+                map_timer.tick(lambda: node.draw_map(), outputs=map_img)
 
-        map_img.select(on_map_select, inputs=init_toggle, outputs=goal_out)
-        # Exposed as a public Gradio API endpoint ("drag_initial") so the browser
-        # drag JS can POST the payload directly (POST /gradio_api/call/drag_initial
-        # with {"data": [payload, mode]}). This is a deterministic bridge that works
-        # regardless of Gradio's component-event semantics. The endpoint is bound to
-        # init_bridge.input so it also works on the legacy event path.
-        init_bridge.input(on_drag_payload, inputs=[init_bridge, init_toggle],
-                          outputs=init_status, api_name="drag_initial")
+                # Camera pulls decoded frames faster than before. Frames are produced by
+                # a background decode thread, so a quick 0.1s pull yields fluid playback
+                # without adding decode work -- it just drains the ready frame queue.
+                cam_timer = gr.Timer(0.1)
+                cam_timer.tick(lambda: node.draw_camera(), outputs=cam_img)
 
-        robot_dd.change(node.set_robot, robot_dd, None)
+                status_timer = gr.Timer(1.0)
+                status_timer.tick(
+                    lambda: (
+                        node.get_connection_status(),
+                        node.get_battery_data(),
+                        node.get_motor_data(),
+                        node.get_orientation_data(),
+                        node.get_pose_data(),
+                        f"{node.current_robot.cam_fps:.1f} fps",
+                    ),
+                    outputs=[conn_out, battery_out, motor_out, orient_out, pose_out, cam_fps_out],
+                )
+
+                # Populate per-robot status cards
+                robot_status_timer = gr.Timer(2.0)
+
+                def robot_status():
+                    texts = []
+                    for name in node.robots:
+                        robot = node.robots[name]
+                        now = node.get_clock().now().nanoseconds / 1e9
+                        map_ok = "🟢 live" if robot.map_stamp > 0 and now - robot.map_stamp < 5.0 else ("🟡 stale" if robot.map_stamp > 0 else "⚪ waiting")
+                        pose_ok = "🟢 live" if robot.robot_pose is not None else "⚪ waiting"
+                        cam_ok = "🟢 live" if robot.cam_fps > 0.5 else "⚪ waiting"
+                        texts.append(map_ok)
+                        texts.append(pose_ok)
+                        texts.append(cam_ok)
+                    return texts
+
+                robot_status_timer.tick(
+                    robot_status,
+                    outputs=[luna_map_status, luna_pose_status, luna_cam_status,
+                             astro_map_status, astro_pose_status, astro_cam_status],
+                )
+
+                def on_map_select(mode, evt: gr.SelectData):
+                    if mode:
+                        return ("Initial Pose mode ON — press and drag on the map to "
+                                "set the initial pose (position + orientation).")
+                    return node.click_to_goal(evt)
+
+                def on_drag_payload(payload, mode):
+                    if not mode:
+                        return "Initial pose drag ignored — toggle \"Set Initial Pose\" ON."
+                    if not payload or "," not in payload:
+                        return "No drag data received."
+                    try:
+                        x1, y1, x2, y2 = [int(x) for x in payload.split(",")]
+                    except Exception:
+                        return f"Bad drag payload: {payload!r}"
+                    return node.drag_to_initial((x1, y1), (x2, y2))
+
+                map_img.select(on_map_select, inputs=init_toggle, outputs=goal_out)
+                # Exposed as a public Gradio API endpoint ("drag_initial") so the browser
+                # drag JS can POST the payload directly (POST /gradio_api/call/drag_initial
+                # with {"data": [payload, mode]}). This is a deterministic bridge that works
+                # regardless of Gradio's component-event semantics. The endpoint is bound to
+                # init_bridge.input so it also works on the legacy event path.
+                init_bridge.input(on_drag_payload, inputs=[init_bridge, init_toggle],
+                                  outputs=init_status, api_name="drag_initial")
+
+                robot_dd.change(node.set_robot, robot_dd, None)
+
+            # ================================================================
+            # TAB 2: PATROLLING (both robots on one map)
+            # ================================================================
+            with gr.Tab("2 Patrolling", id="patrolling"):
+                # ---------- LEFT: PATROL CONTROLS ----------
+                with gr.Column(scale=1, elem_classes=["fleet-panel"]):
+                    gr.Markdown("#### PATROL CONTROLS")
+                    patrol_robot_dd = gr.Dropdown(
+                        choices=list(ROBOTS.keys()),
+                        value=node.patrol_robot,
+                        label="Goal Target Robot",
+                        interactive=True,
+                        elem_classes=["robot-selector"],
+                    )
+
+                    with gr.Group(elem_classes=["robot-card"]):
+                        gr.Markdown("### Fleet Overview")
+                        gr.Markdown(
+                            "**Luna** 🔴 (red) · **Astro** 🟦 (blue)\n\n"
+                            "Both robots are shown together. Click the map to send "
+                            "a nav goal to the robot selected in **Goal Target Robot**."
+                        )
+                    with gr.Group(elem_classes=["robot-card"]):
+                        gr.Markdown("### Goal Routing")
+                        patrol_goal_out = gr.Textbox(
+                            label="Patrol Goal Status", lines=2, interactive=False)
+
+                    gr.Markdown("#### FUTURE: PATROL ROUTES")
+                    with gr.Group(elem_classes=["mission-buttons"]):
+                        with gr.Row():
+                            gr.Button("📍 Add Waypoint", interactive=False)
+                            gr.Button("🚀 Start Patrol", interactive=False)
+
+                # ---------- CENTER: FLEET MAP ----------
+                with gr.Column(scale=2, elem_classes=["map-panel"]):
+                    gr.Markdown("## Fleet Patrolling Map")
+                    patrol_map_img = gr.Image(
+                        label="Occupancy Map — both robots · click to set a nav goal",
+                        type="numpy", elem_id="patrol_map_image", height=520)
+                    gr.Markdown(
+                        "**Legend:** 🔴 **Luna** (red dot, red path) · "
+                        "🟦 **Astro** (blue dot, blue path) — black arrow = heading · "
+                        "**orange target = goal (clears on arrival)**")
+
+                # ---------- RIGHT: PATROL CAMERA ----------
+                with gr.Column(scale=1, elem_classes=["camera-panel"]):
+                    gr.Markdown("## Fleet Camera")
+                    patrol_cam_img = gr.Image(
+                        label="Forward Camera — goal target robot",
+                        type="numpy", height=300)
+                    patrol_cam_fps_out = gr.Textbox(
+                        label="Stream FPS", lines=1, interactive=False)
+
+                # ---------- BOTTOM: PATROL TELEMETRY ----------
+                with gr.Row():
+                    patrol_conn_out = gr.Textbox(
+                        label="Connection Status", lines=2, interactive=False)
+                    patrol_pose_out = gr.Textbox(
+                        label="📍 Pose", lines=2, interactive=False)
+
+                # patrol tickers (run continuously; cheap when tab hidden)
+                patrol_map_timer = gr.Timer(0.5)
+                patrol_map_timer.tick(lambda: node.draw_patrol_map(),
+                                      outputs=patrol_map_img)
+
+                patrol_cam_timer = gr.Timer(0.1)
+                patrol_cam_timer.tick(lambda: node.patrol_draw_camera(),
+                                      outputs=patrol_cam_img)
+
+                patrol_status_timer = gr.Timer(1.0)
+                patrol_status_timer.tick(
+                    lambda: node.patrol_get_status(),
+                    outputs=[patrol_conn_out, patrol_pose_out, patrol_cam_fps_out],
+                )
+
+                def on_patrol_map_select(evt: gr.SelectData):
+                    return node.patrol_click_to_goal(evt)
+
+                patrol_map_img.select(on_patrol_map_select, inputs=None,
+                                      outputs=patrol_goal_out)
+                patrol_robot_dd.change(node.set_patrol_robot, patrol_robot_dd, None)
 
     demo.launch(
         server_name=SERV_NAME,
