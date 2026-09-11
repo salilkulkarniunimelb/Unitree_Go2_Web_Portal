@@ -65,6 +65,7 @@ LUNA_TOPICS = {
     "battery": "/lf/lowstate",
     "goal":    "/luna/goal_pose",
     "initialpose": "/luna/initialpose",
+    "plan":    "/luna/plan",
 }
 
 ASTRO_TOPICS = {
@@ -75,6 +76,7 @@ ASTRO_TOPICS = {
     "battery": "/lf/lowstate",
     "goal":    "/astro/goal_pose",
     "initialpose": "/astro/initialpose",
+    "plan":    "/astro/plan",
 }
 
 ROBOTS = {
@@ -116,7 +118,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Image
 
 try:
@@ -445,6 +447,10 @@ class RobotState:
         self.odom_path = deque(maxlen=2000)
         self.pose_latest = "Waiting for pose..."
         self.last_goal = None
+        # --- Nav2 planned path (published by the robot's global planner on
+        #     /luna|astro/plan when a navigation goal is being executed) ---
+        self.planner_path = None          # list of (wx, wy) in the "map" frame
+        self.planner_path_stamp = 0.0
         # --- initial pose (set via map drag) ---
         self.initial_pose = None          # (wx, wy, yaw) pending/confirmed initial pose
         self.last_initial = None
@@ -569,6 +575,18 @@ class RobotState:
             )
         except Exception:
             pass
+
+    def plan_cb(self, msg):
+        """Store the latest Nav2 global plan (/luna|astro/plan, nav_msgs/msg/Path).
+        This is the path the robot is about to take; it is re-published each time
+        a new navigation goal is planned, so we just remember the newest one."""
+        try:
+            self.planner_path = [
+                (p.pose.position.x, p.pose.position.y) for p in msg.poses
+            ]
+            self.planner_path_stamp = self.node.get_clock().now().nanoseconds / 1e9
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.name}] plan_cb failed: {e}")
 
     @staticmethod
     def _nal_units(raw):
@@ -827,6 +845,22 @@ class RobotState:
             return int(mx * scale) + ox, int(my * scale) + oy
 
         if self.robot_pose is not None:
+            # Nav2 planned path (the route the robot is about to take).
+            if self.planner_path and len(self.planner_path) >= 2:
+                pts = np.array(
+                    [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
+                )
+                cv2.polylines(canvas, [pts], False, (10, 10, 120), 7, cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], False, (255, 120, 20), 3, cv2.LINE_AA)
+
+            # Goal marker (orange crosshair + dot) at the last clicked point.
+            if self.last_goal is not None:
+                gx, gy = to_px(*self.last_goal)
+                cv2.circle(canvas, (gx, gy), 9, (0, 165, 255), 3, cv2.LINE_AA)
+                cv2.circle(canvas, (gx, gy), 3, (0, 165, 255), -1, cv2.LINE_AA)
+                cv2.line(canvas, (gx - 14, gy), (gx + 14, gy), (0, 165, 255), 2, cv2.LINE_AA)
+                cv2.line(canvas, (gx, gy - 14), (gx, gy + 14), (0, 165, 255), 2, cv2.LINE_AA)
+
             px, py = to_px(self.robot_pose.position.x, self.robot_pose.position.y)
             cv2.circle(canvas, (px, py), 10, (255, 0, 0), -1)
             ex = int(px + 30 * math.cos(self.yaw))
@@ -1039,6 +1073,10 @@ class LabRobotNode(Node):
             self.create_subscription(PoseWithCovarianceStamped, topics["pose"],
                                      robot.pose_cb, 10)
             self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
+            # Nav2's global planner publishes the path currently being followed
+            # on /luna|astro/plan; draw it on the map so the operator can see the
+            # route the robot is about to take before/while it drives.
+            self.create_subscription(Path, topics["plan"], robot.plan_cb, 10)
             if Go2FrontVideoData is not None:
                 # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
                 # RELIABLE depth-10 subscription drops messages under the burst
@@ -1263,7 +1301,7 @@ def main():
                     init_bridge = gr.Textbox(visible=True, show_label=False,
                                              elem_id="initpose_bridge", scale=0)
 
-                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · blue = explored · dark = walls")
+                gr.Markdown("**Legend:** 🔴 robot (black arrow = heading) · **blue line = planned path** · **orange target = goal** · blue = explored · dark = walls")
 
                 with gr.Group():
                     gr.Markdown("#### FUTURE: 3D VIEW")
