@@ -477,6 +477,17 @@ class RobotState:
         #     /luna|astro/plan when a navigation goal is being executed) ---
         self.planner_path = None          # list of (wx, wy) in the "map" frame
         self.planner_path_stamp = 0.0
+        # --- map-frame body anchoring ------------------------------------
+        # The lab's AMCL (/luna|astro/amcl_pose) is NOT publishing, so the
+        # odom fallback is used for the robot body. Odom lives in the odom
+        # frame while the map + Nav2 plan are in the "map" frame, so drawing
+        # the odom body with the map transform misplaces it (body off the
+        # route). The Nav2 plan starts at the robot's current map-frame pose,
+        # so we derive an odom->map offset from the plan's first point at each
+        # replan and re-anchor the odom body into the map frame.
+        self.last_odom = None             # latest (x, y) in the odom frame
+        self.odom_to_map = None           # (dx, dy) odom -> map offset
+        self.plan_start_yaw = None        # heading at the plan start (map frame)
         # --- initial pose (set via map drag) ---
         self.initial_pose = None          # (wx, wy, yaw) pending/confirmed initial pose
         self.last_initial = None
@@ -579,6 +590,7 @@ class RobotState:
 
     def odom_cb(self, msg):
         p = msg.pose.pose
+        self.last_odom = (p.position.x, p.position.y)
         self.odom_path.append(
             (p.position.x, p.position.y)
         )
@@ -611,12 +623,70 @@ class RobotState:
                 (p.pose.position.x, p.pose.position.y) for p in msg.poses
             ]
             self.planner_path_stamp = self.node.get_clock().now().nanoseconds / 1e9
+            # Re-anchor the odom body into the map frame: the first plan pose is
+            # the robot's current map-frame position, so the difference against
+            # the (nearly simultaneous) odom reading is the odom->map offset.
+            if msg.poses:
+                fp = msg.poses[0].pose
+                fx, fy = fp.position.x, fp.position.y
+                if self.last_odom is not None:
+                    self.odom_to_map = (fx - self.last_odom[0],
+                                        fy - self.last_odom[1])
+                # Prefer the plan's stated heading (map frame) for the body arrow.
+                try:
+                    q = fp.orientation
+                    self.plan_start_yaw = math.atan2(
+                        2.0 * (q.w * q.z + q.x * q.y),
+                        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+                    )
+                except Exception:
+                    pass
+                if self.pose_from_amcl:
+                    self.pose_latest = (
+                        f"x: {self.robot_pose.position.x:.3f}   "
+                        f"y: {self.robot_pose.position.y:.3f}   "
+                        f"yaw: {self.yaw:.3f} rad"
+                    )
+                else:
+                    self.pose_latest = (
+                        f"x: {fx:.3f}   "
+                        f"y: {fy:.3f}   "
+                        f"yaw: {self.plan_start_yaw:.3f} rad "
+                        f"(from plan)"
+                    )
             self.node.get_logger().info(
                 f"[{self.name}] /plan received: {len(self.planner_path)} pts "
                 f"frame={getattr(msg.header, 'frame_id', '?')!r}"
+                f" odom->map={self.odom_to_map}"
             )
         except Exception as e:
             self.node.get_logger().error(f"[{self.name}] plan_cb failed: {e}")
+
+    def map_pose(self):
+        """Best available robot position expressed in the 'map' frame.
+
+        Returns (x, y, yaw) or None. Order of preference:
+          1. AMCL pose (accurate, already map frame).
+          2. Odom re-anchored into the map frame via the offset taken from the
+             Nav2 plan's start pose (used while navigating without AMCL, and
+             kept after arrival so the body does not jump frames).
+          3. Nav2 plan start pose (map frame).
+          4. Raw odom (unreliable frame, last resort before any map data)."""
+        if self.pose_from_amcl and self.robot_pose is not None:
+            return (self.robot_pose.position.x,
+                    self.robot_pose.position.y, self.yaw)
+        if (self.odom_to_map is not None and self.last_odom is not None):
+            yaw = self.plan_start_yaw if self.plan_start_yaw is not None else self.yaw
+            return (self.last_odom[0] + self.odom_to_map[0],
+                    self.last_odom[1] + self.odom_to_map[1], yaw)
+        if self.planner_path:
+            fx, fy = self.planner_path[0]
+            yaw = self.plan_start_yaw if self.plan_start_yaw is not None else self.yaw
+            return (fx, fy, yaw)
+        if self.robot_pose is not None:
+            return (self.robot_pose.position.x,
+                    self.robot_pose.position.y, self.yaw)
+        return None
 
     @staticmethod
     def _nal_units(raw):
@@ -874,18 +944,15 @@ class RobotState:
             my = h - 1 - my
             return int(mx * scale) + ox, int(my * scale) + oy
 
-        if self.robot_pose is not None:
+        mp = self.map_pose()
+        if mp is not None:
+            body_x, body_y, body_yaw = mp
             # Once the robot arrives at the goal, clear the plan + goal marker
             # so the path disappears from the map. "Arrived" = the current
-            # map-frame pose is within tolerance of the goal. odom_path lives in
-            # the odom frame, so it must NOT be compared against the map-frame
-            # goal -- that frame mismatch could clear the route prematurely.
+            # map-frame pose is within tolerance of the goal.
             if self.last_goal is not None:
                 gx, gy = self.last_goal
-                d_now = math.hypot(
-                    self.robot_pose.position.x - gx,
-                    self.robot_pose.position.y - gy,
-                )
+                d_now = math.hypot(body_x - gx, body_y - gy)
                 if d_now < GOAL_REACHED_TOLERANCE:
                     self.planner_path = None
                     self.last_goal = None
@@ -907,11 +974,11 @@ class RobotState:
                 cv2.line(canvas, (gx - 14, gy), (gx + 14, gy), (0, 165, 255), 2, cv2.LINE_AA)
                 cv2.line(canvas, (gx, gy - 14), (gx, gy + 14), (0, 165, 255), 2, cv2.LINE_AA)
 
-            px, py = to_px(self.robot_pose.position.x, self.robot_pose.position.y)
+            px, py = to_px(body_x, body_y)
             dot = colors["fill"]
             cv2.circle(canvas, (px, py), 10, dot, -1)
-            ex = int(px + 30 * math.cos(self.yaw))
-            ey = int(py - 30 * math.sin(self.yaw))
+            ex = int(px + 30 * math.cos(body_yaw))
+            ey = int(py - 30 * math.sin(body_yaw))
             cv2.arrowedLine(canvas, (px, py), (ex, ey), (0, 0, 0), 3)
 
             canvas = cv2.rotate(canvas, cv2.ROTATE_90_CLOCKWISE)
@@ -987,7 +1054,11 @@ class RobotState:
         return text
 
     def get_pose_data(self):
-        pos = self.pose_latest
+        mp = self.map_pose()
+        if mp is None:
+            return self.pose_latest
+        bx, by, byaw = mp
+        pos = (f"x: {bx:.3f}   y: {by:.3f}   yaw: {byaw:.3f} rad")
         if self.last_goal:
             return (f"{pos}\n🎯 last goal: "
                     f"({self.last_goal[0]:.2f}, {self.last_goal[1]:.2f})")
@@ -1281,18 +1352,16 @@ class LabRobotNode(Node):
 
         # Draw each robot's plan + goal (same logic as single-robot draw_map).
         for name, robot in self.robots.items():
-            if robot.robot_pose is None:
+            mp = robot.map_pose()
+            if mp is None:
                 continue
+            body_x, body_y, body_yaw = mp
             colors = ROBOT_COLORS.get(name, ROBOT_COLORS["Luna"])
             # Goal-reached check: clears the plan so the path disappears. Only
-            # the current map-frame pose is compared to the goal (odom_path is
-            # in the odom frame and must not be compared against it).
+            # the current map-frame pose is compared to the goal.
             if robot.last_goal is not None:
                 gx, gy = robot.last_goal
-                d_now = math.hypot(
-                    robot.robot_pose.position.x - gx,
-                    robot.robot_pose.position.y - gy,
-                )
+                d_now = math.hypot(body_x - gx, body_y - gy)
                 if d_now < GOAL_REACHED_TOLERANCE:
                     robot.planner_path = None
                     robot.last_goal = None
@@ -1318,11 +1387,11 @@ class LabRobotNode(Node):
 
             fill = colors.get("fill", (255, 0, 0))
             outline = colors.get("outline", (180, 0, 0))
-            px, py = to_px(robot.robot_pose.position.x, robot.robot_pose.position.y)
+            px, py = to_px(body_x, body_y)
             cv2.circle(canvas, (px, py), 10, fill, -1)
             cv2.circle(canvas, (px, py), 10, outline, 2)
-            ex = int(px + 30 * math.cos(robot.yaw))
-            ey = int(py - 30 * math.sin(robot.yaw))
+            ex = int(px + 30 * math.cos(body_yaw))
+            ey = int(py - 30 * math.sin(body_yaw))
             cv2.arrowedLine(canvas, (px, py), (ex, ey), (0, 0, 0), 3)
             label_positions.append((px, py, name))
 
