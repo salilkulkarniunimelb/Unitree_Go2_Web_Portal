@@ -3,8 +3,14 @@
 # restore_dashboard.sh - ONE-COMMAND restore of the QOD Lab Go2 map dashboard.
 #
 # Run from YOUR LAPTOP. Fully self-contained: recreates the robot_hivemind
-# container if missing, installs deps, copies the portal into it, starts it,
-# opens the SSH tunnel, and opens the dashboard in your browser.
+# container if missing (from the snapshot image, which has the code, Python
+# deps and the auto-boot entrypoint baked in), syncs the latest files,
+# verifies deps/ffmpeg, starts the portal, opens the SSH tunnel, and opens
+# the dashboard in your browser.
+#
+# The container runs with --restart unless-stopped and its entrypoint
+# (boot.sh) auto-starts the portal on every server boot / docker restart, so
+# the dashboard comes back on its own even if the machine reboots.
 #
 # Usage:
 #   bash restore_dashboard.sh
@@ -14,9 +20,12 @@
 set -e
 
 SERVER="${SERVER:-salil.kulkarni@10.4.48.11}"
+HOST="${SERVER#*@}"
 CONTAINER="robot_hivemind"
-IMAGE="${IMAGE:-unimelb-humble:base}"
+IMAGE="${IMAGE:-unimelb-humble:dashboard}"   # snapshot: code + deps + boot.sh baked in
+ENTRYPOINT="bash /workspace/boot.sh"
 PORT=7860
+FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh"
 
 SSH="ssh -o BatchMode=yes $SERVER"
 SCP="scp -o BatchMode=yes"
@@ -26,17 +35,18 @@ echo " Restoring QOD Lab Go2 map dashboard -> $SERVER"
 echo "============================================================"
 
 # --- 1) Make sure the portal files exist locally ---------------------------
-for f in lab_portal.py lab_start.sh; do
+for f in $FILES; do
     [ -f "$f" ] || { echo "ERROR: $f missing. Run from the repo root, or restore it: git checkout 29555bd -- $f"; exit 1; }
 done
 
 # --- 2) Container must exist ------------------------------------------------
 echo "[1/5] Checking container $CONTAINER..."
+NEW_CONTAINER=0
 if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
-    echo "  -> Container missing. Recreating from $IMAGE (host networking)..."
-    $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped \
-        $IMAGE sleep infinity"
-    echo "  -> Container recreated."
+    echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
+    $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped $IMAGE $ENTRYPOINT"
+    echo "  -> Container recreated. boot.sh auto-starts the portal."
+    NEW_CONTAINER=1
 else
     if ! $SSH "docker inspect -f '{{.State.Running}}' $CONTAINER" | grep -q true; then
         echo "  -> Container exists but stopped. Starting it..."
@@ -46,10 +56,11 @@ fi
 
 # --- 3) Copy portal files into /workspace ----------------------------------
 echo "[2/5] Copying portal files into container..."
-$SCP lab_portal.py lab_start.sh "$SERVER:/tmp/"
-$SSH "docker cp /tmp/lab_portal.py $CONTAINER:/workspace/lab_portal.py"
-$SSH "docker cp /tmp/lab_start.sh $CONTAINER:/workspace/lab_start.sh"
-$SSH "docker exec $CONTAINER chmod +x /workspace/lab_start.sh"
+$SCP $FILES "$SERVER:/tmp/"
+for f in $FILES; do
+    $SSH "docker cp /tmp/$f $CONTAINER:/workspace/$f"
+done
+$SSH "docker exec $CONTAINER chmod +x /workspace/lab_start.sh /workspace/start_dashboard.sh /workspace/boot.sh"
 # The dashboard logo and any assets are served from the container, so copy
 # the whole assets/ folder (missing logo caused a FileNotFoundError crash).
 if [ -d assets ]; then
@@ -96,9 +107,23 @@ $SSH "docker exec $CONTAINER bash -lc '
 '"
 
 # --- 6) Start the portal ------------------------------------------------------
-echo "[5/6] Starting the portal..."
-$SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh stop || true'"
-$SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh start'"
+echo "[5/5] Starting the portal..."
+if [ "$NEW_CONTAINER" = "1" ]; then
+    # A fresh container already has boot.sh auto-starting the portal.
+    echo "  -> New container: boot.sh is starting the portal..."
+else
+    $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh stop || true'"
+    $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh start'"
+fi
+
+echo "  -> Waiting for the portal to answer on port $PORT..."
+for i in $(seq 1 30); do
+    if $SSH "curl -s --noproxy '*' -o /dev/null http://$HOST:$PORT/ 2>/dev/null"; then
+        echo "  -> Portal is UP."
+        break
+    fi
+    sleep 2
+done
 
 # --- 7) Tunnel + open browser --------------------------------------------------
 echo "[6/6] Opening SSH tunnel..."
@@ -109,9 +134,7 @@ if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "DONE. Dashboard restored."
-echo "  -> http://localhost:$PORT        (open this in your browser)"
-echo ""
-echo "Repo backup: pushed to GitHub ->"
-echo "  git push origin main            (do this once to upload the backup)"
+echo "DONE. Dashboard restored and auto-start enabled."
+echo "  -> http://localhost:$PORT       (tunneled, this laptop)"
+echo "  -> http://$HOST:$PORT     (anyone on the network)"
 exit 0
