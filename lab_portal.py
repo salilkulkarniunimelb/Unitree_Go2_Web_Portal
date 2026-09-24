@@ -12,6 +12,12 @@ lab's real topics (bridged from the Go2 over Zenoh / domain 70):
     CAMERA  /frontvideostream             (sensor_msgs/msg/Image)
     BATTERY /lf/lowstate                  (unitree_go/msg/LowState)
 
+    Camera (default): the front camera is pulled from the QOD streaming
+    platform's WebRTC SFU (the same channel + decode path the qod website uses),
+    so the dashboard keeps showing the dog's camera even when the ROS
+    /frontvideostream bridge is not publishing. Set LAB_CAMERA_SOURCE=ros to
+    fall back to the legacy Go2FrontVideoData ROS-topic decoder.
+
 Layout mirrors the Hivemind mission dashboard:
     - Workflow stepper (mapping -> scenario -> localisation -> operations)
     - Robot fleet panel (Luna / Astro cards with live status)
@@ -37,6 +43,7 @@ Usage:
 """
 
 import math
+import os
 import queue
 import threading
 import time
@@ -62,6 +69,7 @@ LUNA_TOPICS = {
     "pose":    "/luna/amcl_pose",
     "odom":    "/luna/go2/restamped/robot_odom",
     "camera":  "/luna/frontvideostream",
+    "source":  "luna",
     "battery": "/lf/lowstate",
     "goal":    "/luna/goal_pose",
     "initialpose": "/luna/initialpose",
@@ -73,6 +81,7 @@ ASTRO_TOPICS = {
     "pose":    "/astro/amcl_pose",
     "odom":    "/astro/go2/restamped/robot_odom",
     "camera":  "/astro/frontvideostream",
+    "source":  "astro",
     "battery": "/lf/lowstate",
     "goal":    "/astro/goal_pose",
     "initialpose": "/astro/initialpose",
@@ -106,6 +115,17 @@ CAM_FRAMES_MAX = 20
 # Sized generously so a full GOP (which may include one keyframe + many P-frames)
 # fits in the window even as the buffer scrolls, keeping the camera continuous.
 CAM_DECODE_WINDOW = 4 * 1024 * 1024
+
+# ----------------------- Camera source (QOD WebRTC vs ROS) ------------
+# "webrtc" (default): consume the dog's front camera from the QOD platform's
+# WebRTC SFU on 127.0.0.1:8000 - the same channel and decode path the qod
+# streaming platform website uses. This keeps the camera live even when the ROS
+# /frontvideostream bridge is not publishing (identical frames to the website).
+# "ros": legacy Go2FrontVideoData ROS-topic subscription + file decode above.
+CAMERA_SOURCE = os.getenv("LAB_CAMERA_SOURCE", "webrtc").strip().lower()
+QOD_SIGNALING_URL = os.getenv(
+    "QOD_SIGNALING_URL", "ws://127.0.0.1:8000/ws/signaling"
+)
 
 FT_FRAME = "map"
 
@@ -506,7 +526,32 @@ class RobotState:
         # trim the tail to the latest SPS keyframe sequence, and decode that
         # window from a file on a background thread. Reliable, keeps the icon
         # green, and delivers a live multi-fps camera.
-        threading.Thread(target=self._camera_decode_loop, daemon=True).start()
+        if CAMERA_SOURCE == "webrtc":
+            # Pull the camera from the QOD SFU instead of ROS (same feed the qod
+            # website shows). Decoded BGR frames arrive via _on_qod_frame and are
+            # queued into the same _cam_frames deck draw_camera() plays back.
+            self._qod_consumer = None
+            qod_source = self.topics.get("source")
+            if qod_source:
+                try:
+                    from web_backend.qod_consumer import QodCameraConsumer
+                    self._qod_consumer = QodCameraConsumer(
+                        source_id=qod_source,
+                        name=self.name,
+                        signaling_url=QOD_SIGNALING_URL,
+                        on_frame=self._on_qod_frame,
+                    )
+                    self._qod_consumer.start()
+                    self.node.get_logger().info(
+                        f"[{self.name}] camera via QOD WebRTC (source={qod_source}, "
+                        f"{QOD_SIGNALING_URL})"
+                    )
+                except Exception as e:
+                    self.node.get_logger().error(
+                        f"[{self.name}] failed to start QOD camera consumer: {e}"
+                    )
+        else:
+            threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
         self.battery = None
         self.voltage = None
@@ -737,6 +782,23 @@ class RobotState:
             self.cam_stamp = self.node.get_clock().now().nanoseconds / 1e9
         except Exception as e:
             self.node.get_logger().error(f"Camera buffer failed: {e}")
+
+    def _on_qod_frame(self, frame):
+        """Queue a decoded BGR frame from the QOD WebRTC consumer for smooth
+        playback. draw_camera() pops from the same _cam_frames deck used by the
+        ROS decode path, so the UI code is shared."""
+        try:
+            h, w = frame.shape[:2]
+            if w > CAM_W or h > CAM_H:
+                frame = cv2.resize(frame, (CAM_W, CAM_H),
+                                   interpolation=cv2.INTER_AREA)
+            with self._cam_lock:
+                self._cam_frames.append(frame)
+                self.color_frame = frame
+            self.cam_frame_ts = time.time()
+            self.cam_stamp = time.time()
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.name}] QOD frame failed: {e}")
 
     @staticmethod
     def _trim_to_keyframe(raw):
@@ -1195,12 +1257,13 @@ class LabRobotNode(Node):
             # on /luna|astro/plan; draw it on the map so the operator can see the
             # route the robot is about to take before/while it drives.
             self.create_subscription(Path, topics["plan"], robot.plan_cb, 10)
-            if Go2FrontVideoData is not None:
+            if Go2FrontVideoData is not None and CAMERA_SOURCE != "webrtc":
                 # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
                 # RELIABLE depth-10 subscription drops messages under the burst
                 # load, which slices gaps into the H.264 stream and makes it
                 # impossible to decode any frame. Use BEST_EFFORT + a deep
                 # history so the newest contiguous bytes arrive without gap.
+                # (Skipped in "webrtc" mode: the camera comes from the QOD SFU.)
                 cam_qos = QoSProfile(
                     depth=100,
                     reliability=ReliabilityPolicy.BEST_EFFORT,

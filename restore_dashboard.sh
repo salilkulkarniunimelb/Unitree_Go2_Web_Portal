@@ -26,6 +26,7 @@ IMAGE="${IMAGE:-unimelb-humble:dashboard}"   # snapshot: code + deps + boot.sh b
 ENTRYPOINT="bash /workspace/boot.sh"
 PORT=7860
 FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh"
+WEB_BACKEND_FILE="web_backend/qod_consumer.py"
 
 SSH="ssh -o BatchMode=yes $SERVER"
 SCP="scp -o BatchMode=yes"
@@ -40,7 +41,7 @@ for f in $FILES; do
 done
 
 # --- 2) Container must exist ------------------------------------------------
-echo "[1/5] Checking container $CONTAINER..."
+echo "[1/7] Checking container $CONTAINER..."
 NEW_CONTAINER=0
 if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
@@ -55,12 +56,19 @@ else
 fi
 
 # --- 3) Copy portal files into /workspace ----------------------------------
-echo "[2/5] Copying portal files into container..."
+echo "[2/7] Copying portal files into container..."
 $SCP $FILES "$SERVER:/tmp/"
 for f in $FILES; do
     $SSH "docker cp /tmp/$f $CONTAINER:/workspace/$f"
 done
 $SSH "docker exec $CONTAINER chmod +x /workspace/lab_start.sh /workspace/start_dashboard.sh /workspace/boot.sh"
+# The QOD WebRTC camera consumer module (used by lab_portal.py).
+if [ -f "$WEB_BACKEND_FILE" ]; then
+    echo "  -> Copying $WEB_BACKEND_FILE into container..."
+    $SSH "docker exec $CONTAINER mkdir -p /workspace/web_backend"
+    $SCP "$WEB_BACKEND_FILE" "$SERVER:/tmp/qod_consumer.py"
+    $SSH "docker cp /tmp/qod_consumer.py $CONTAINER:/workspace/web_backend/qod_consumer.py"
+fi
 # The dashboard logo and any assets are served from the container, so copy
 # the whole assets/ folder (missing logo caused a FileNotFoundError crash).
 if [ -d assets ]; then
@@ -77,7 +85,7 @@ if [ -d assets ]; then
 fi
 
 # --- 4) Ensure Python deps --------------------------------------------------
-echo "[3/5] Ensuring Python deps (installs only if missing)..."
+echo "[3/7] Ensuring Python deps (installs only if missing)..."
 # NOTE: numpy is pinned to <2 because the ROS cv_bridge package was compiled
 # against NumPy 1.x and crashes with NumPy 2.x (_ARRAY_API not found), and
 # opencv is pinned to <5 to stay numpy<2 compatible.
@@ -96,7 +104,7 @@ $SSH "docker exec $CONTAINER bash -lc '
 '"
 
 # --- 5) Ensure ffmpeg (for the live H.264 camera pipeline) -----------------
-echo "[4/5] Ensuring ffmpeg (installs only if missing)..."
+echo "[4/7] Ensuring ffmpeg (installs only if missing)..."
 $SSH "docker exec $CONTAINER bash -lc '
     if ! command -v ffmpeg >/dev/null 2>&1; then
         echo \"  -> installing ffmpeg...\"
@@ -106,8 +114,19 @@ $SSH "docker exec $CONTAINER bash -lc '
     fi
 '"
 
+# --- 5) Ensure QOD WebRTC consumer deps (aiortc, websockets) --------------
+echo "[5/7] Ensuring QOD WebRTC camera deps (aiortc, websockets)..."
+$SSH "docker exec $CONTAINER bash -lc '
+    if ! python3 -c \"import aiortc,websockets\" 2>/dev/null; then
+        echo \"  -> installing aiortc + websockets (QOD camera consumer)...\"
+        python3 -m pip install --no-cache-dir \"aiortc>=1.15.0\" websockets
+    else
+        echo webrtc-deps-ok
+    fi
+'"
+
 # --- 6) Start the portal ------------------------------------------------------
-echo "[5/5] Starting the portal..."
+echo "[6/7] Starting the portal..."
 if [ "$NEW_CONTAINER" = "1" ]; then
     # A fresh container already has boot.sh auto-starting the portal.
     echo "  -> New container: boot.sh is starting the portal..."
@@ -126,7 +145,7 @@ for i in $(seq 1 30); do
 done
 
 # --- 7) Tunnel + open browser --------------------------------------------------
-echo "[6/6] Opening SSH tunnel..."
+echo "[7/7] Opening SSH tunnel..."
 if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
     nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
     disown || true
