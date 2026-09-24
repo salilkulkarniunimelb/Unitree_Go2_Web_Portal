@@ -155,6 +155,12 @@ FT_FRAME = "map"
 # tolerate AMCL noise and Nav2 stopping a little short of the exact point.
 GOAL_REACHED_TOLERANCE = 1.0
 
+# ROS heading sources can stall (AMCL silent after start, or a one-shot /plan
+# that is only re-published per goal). AMCL pose/yaw is trusted only while
+# fresh; after this many seconds without a sample we fall back to the live
+# odometry heading re-anchored into the map frame.
+AMCL_FRESH_SECS = 3.0
+
 # Per-robot visual identity. NOTE: cv2 draws BGR but Gradio displays RGB, so
 # these tuples equal the browser colours (channel 0 = red on screen).
 # Red = Luna, blue = Astro.
@@ -164,6 +170,15 @@ ROBOT_COLORS = {
     "Astro": dict(fill=(0, 200, 255), outline=(0, 140, 200),
                   path_dark=(0, 0, 160), path_bright=(0, 0, 255)),
 }
+
+
+def _norm_angle(a):
+    """Wrap an angle to (-pi, pi]."""
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a <= -math.pi:
+        a += 2 * math.pi
+    return a
 
 
 def _draw_plan(canvas, pts, dark, bright):
@@ -528,7 +543,10 @@ class RobotState:
         # replan and re-anchor the odom body into the map frame.
         self.last_odom = None             # latest (x, y) in the odom frame
         self.odom_to_map = None           # (dx, dy) odom -> map offset
+        self.odom_yaw = None              # latest odom-frame heading (always kept)
+        self.odom_to_map_yaw = None       # learned odom -> map rotation offset
         self.plan_start_yaw = None        # heading at the plan start (map frame)
+        self._last_amcl_wall = 0.0        # last AMCL sample (wall clock)
         # --- initial pose (set via map drag) ---
         self.initial_pose = None          # (wx, wy, yaw) pending/confirmed initial pose
         self.last_initial = None
@@ -661,11 +679,17 @@ class RobotState:
         p = getattr(pose, "pose", pose)  # PoseWithCovarianceStamped -> .pose.pose
         self.robot_pose = p
         self.pose_from_amcl = True       # AMCL is the accurate per-robot source
+        self._last_amcl_wall = time.time()
         q = p.orientation
         self.yaw = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
+        # Learn the odom -> map rotation from AMCL (map-frame heading minus the
+        # near-simultaneous odom-frame heading) too, so a live re-anchored
+        # heading stays available after AMCL goes quiet / between plans.
+        if self.odom_yaw is not None:
+            self.odom_to_map_yaw = _norm_angle(self.yaw - self.odom_yaw)
         self.pose_latest = (
             f"x: {p.position.x:.3f}   "
             f"y: {p.position.y:.3f}   "
@@ -678,18 +702,25 @@ class RobotState:
         self.odom_path.append(
             (p.position.x, p.position.y)
         )
+        q = p.orientation
+        try:
+            # Always keep the latest odom-frame heading so we can re-anchor it
+            # into the map frame with the learned rotation offset (this is what
+            # keeps the heading arrow live while travelling).
+            self.odom_yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            )
+        except Exception:
+            pass
         # The per-robot odom topic is a fallback pose source. Once the accurate
         # AMCL pose has been received, keep using AMCL (odom would otherwise
         # drift / overwrite the localized position and misplace the robot dot).
         if self.pose_from_amcl:
             return
-        q = p.orientation
         try:
             self.robot_pose = p
-            self.yaw = math.atan2(
-                2.0 * (q.w * q.z + q.x * q.y),
-                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-            )
+            self.yaw = self.odom_yaw
             self.pose_latest = (
                 f"x: {p.position.x:.3f}   "
                 f"y: {p.position.y:.3f}   "
@@ -725,6 +756,16 @@ class RobotState:
                     )
                 except Exception:
                     pass
+                # Learn the odom -> map rotation: the plan's first pose heading
+                # is the robot's map-frame heading at plan time, while odom_yaw
+                # is the same physical heading in the odom frame (odom and map
+                # axes differ by a fixed rotation). This offset lets us keep a
+                # live map-frame heading between plans / while AMCL is silent.
+                if (self.plan_start_yaw is not None
+                        and self.odom_yaw is not None):
+                    self.odom_to_map_yaw = _norm_angle(
+                        self.plan_start_yaw - self.odom_yaw
+                    )
                 if self.pose_from_amcl:
                     self.pose_latest = (
                         f"x: {self.robot_pose.position.x:.3f}   "
@@ -746,26 +787,42 @@ class RobotState:
         except Exception as e:
             self.node.get_logger().error(f"[{self.name}] plan_cb failed: {e}")
 
+    def _live_map_yaw(self):
+        """Best continuously-updating map-frame heading.
+
+        Re-anchor the latest odom heading into the map frame using the learned
+        rotation offset (from a plan start pose or AMCL while it was fresh), so
+        the heading arrow turns in real time as the robot drives - even between
+        /plan re-publishes or while AMCL is silent."""
+        if self.odom_to_map_yaw is not None and self.odom_yaw is not None:
+            return _norm_angle(self.odom_yaw + self.odom_to_map_yaw)
+        if self.plan_start_yaw is not None:
+            return self.plan_start_yaw
+        return self.yaw
+
     def map_pose(self):
         """Best available robot position expressed in the 'map' frame.
 
         Returns (x, y, yaw) or None. Order of preference:
-          1. AMCL pose (accurate, already map frame).
+          1. AMCL pose, as long as it is still publishing (fresh samples).
           2. Odom re-anchored into the map frame via the offset taken from the
-             Nav2 plan's start pose (used while navigating without AMCL, and
-             kept after arrival so the body does not jump frames).
+             Nav2 plan's start pose (used while navigating without AMCL / when
+             AMCL stalls, and kept after arrival so the body does not jump
+             frames). The heading here is LIVE (re-anchored odom yaw).
           3. Nav2 plan start pose (map frame).
           4. Raw odom (unreliable frame, last resort before any map data)."""
-        if self.pose_from_amcl and self.robot_pose is not None:
+        amcl_fresh = (self.pose_from_amcl
+                      and time.time() - self._last_amcl_wall <= AMCL_FRESH_SECS)
+        if amcl_fresh and self.robot_pose is not None:
             return (self.robot_pose.position.x,
                     self.robot_pose.position.y, self.yaw)
         if (self.odom_to_map is not None and self.last_odom is not None):
-            yaw = self.plan_start_yaw if self.plan_start_yaw is not None else self.yaw
+            yaw = self._live_map_yaw()
             return (self.last_odom[0] + self.odom_to_map[0],
                     self.last_odom[1] + self.odom_to_map[1], yaw)
         if self.planner_path:
             fx, fy = self.planner_path[0]
-            yaw = self.plan_start_yaw if self.plan_start_yaw is not None else self.yaw
+            yaw = self._live_map_yaw()
             return (fx, fy, yaw)
         if self.robot_pose is not None:
             return (self.robot_pose.position.x,
@@ -1354,7 +1411,18 @@ class LabRobotNode(Node):
             # localized position for drawing each robot on the map.
             self.create_subscription(PoseWithCovarianceStamped, topics["pose"],
                                      robot.pose_cb, 10)
-            self.create_subscription(Odometry, topics["odom"], robot.odom_cb, 10)
+            # Live odometry. The robot odom topics here are bridged by
+            # zenoh_bridge_ros2dds, which publishes BEST_EFFORT; a RELIABLE
+            # subscription is QoS-incompatible and silently receives nothing
+            # (dead robot body/heading on the map). Use BEST_EFFORT + deep
+            # history so odom - and therefore the live heading - always flows.
+            odom_qos = QoSProfile(
+                depth=20,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            self.create_subscription(Odometry, topics["odom"], robot.odom_cb,
+                                     qos_profile=odom_qos)
             # Nav2's global planner publishes the path currently being followed
             # on /luna|astro/plan; draw it on the map so the operator can see the
             # route the robot is about to take before/while it drives.
@@ -1402,12 +1470,26 @@ class LabRobotNode(Node):
         while True:
             try:
                 for name, robot in self.robots.items():
+                    live_yaw = robot._live_map_yaw()
+                    if (robot.pose_from_amcl
+                            and time.time() - robot._last_amcl_wall
+                            <= AMCL_FRESH_SECS):
+                        src = "amcl"
+                    elif robot.odom_to_map_yaw is not None:
+                        src = "odom+off"
+                    elif robot.plan_start_yaw is not None:
+                        src = "plan"
+                    else:
+                        src = "odom"
                     self.get_logger().info(
                         f"[DIAG] {name}: map={robot.cached_map_img is not None} "
                         f"pose={'y' if robot.robot_pose is not None else 'n'} "
                         f"plan={'y' if robot.planner_path and len(robot.planner_path) >= 2 else 'n'} "
                         f"plan_pts={len(robot.planner_path) if robot.planner_path else 0} "
-                        f"pose_txt={robot.pose_latest!r} cam_frame={'y' if robot.color_frame is not None else 'n'} "
+                        f"pose_txt={robot.pose_latest!r} "
+                        f"hdg={src} "
+                        f"map_yaw={(live_yaw if live_yaw is not None else float('nan')):.2f} "
+                        f"cam_frame={'y' if robot.color_frame is not None else 'n'} "
                         f"cam_ts={robot.cam_frame_ts:.1f} cam_fps={robot.cam_fps:.2f} "
                         f"det={len(robot._qod_detections.detections()) if getattr(robot, '_qod_detections', None) else 'n/a'}"
                     )
