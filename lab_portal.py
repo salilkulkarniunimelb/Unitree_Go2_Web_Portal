@@ -26,8 +26,8 @@ Layout mirrors the Hivemind mission dashboard:
 
 Working features stream live (map, camera, battery, pose). Features not yet
 implemented (scenario/operations steps, 3D Foxglove view, ROS gateway, 5G
-link, RealSense/YOLO streams) are shown as disabled placeholders for future
-wiring, so the buttons/sections already exist.
+link, RealSense/YOLO streams) have been removed from the layout until they are
+wired up.
 
 The page ALWAYS loads. Every section shows a "Waiting for ..." placeholder
 until its topic starts publishing. Click the map to publish a navigation goal
@@ -1794,30 +1794,12 @@ def main():
 
                         gr.Markdown("**Legend:** 🔴 **Luna** (red dot · red route) · 🟦 **Astro** (blue dot · blue route) · black arrow = heading · **orange target = goal (route clears on arrival)** · blue = explored · dark = walls")
 
-                        with gr.Group():
-                            gr.Markdown("#### FUTURE: 3D VIEW")
-                            gr.Textbox(label="3D Foxglove Panel (port 8765)", value="Awaiting ROS gateway...",
-                                       lines=1, interactive=False)
-
                     # ---------- RIGHT: LIVE CAMERA ----------
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
                         gr.Markdown("## Live Camera")
                         cam_img = gr.Image(label="Forward Camera — selected robot",
                                            type="numpy", height=300)
                         cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
-                        gr.Markdown("#### FUTURE: ADDITIONAL VIEWS")
-                        with gr.Group():
-                            with gr.Row():
-                                gr.Button("📷 Depth", interactive=False)
-                                gr.Button("🎨 Color", interactive=False)
-                                gr.Button("🔍 YOLO", interactive=False)
-                        with gr.Group():
-                            gr.Textbox(label="RealSense Depth", value="Awaiting stream...",
-                                       lines=1, interactive=False)
-                            gr.Textbox(label="RealSense Color", value="Awaiting stream...",
-                                       lines=1, interactive=False)
-                            gr.Textbox(label="YOLO Detections", value="Awaiting stream...",
-                                       lines=1, interactive=False)
 
                 # ================================================================
                 # BOTTOM ROW: TELEMETRY + STATUS FOOTER
