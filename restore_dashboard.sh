@@ -149,9 +149,16 @@ for i in $(seq 1 30); do
 done
 
 # --- 7) Tunnel + open browser --------------------------------------------------
-echo "[7/7] Opening SSH tunnel..."
+echo "[7/7] Opening SSH tunnels..."
 if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
     nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
+    disown || true
+    sleep 4
+fi
+# Patrol planner UI (embedded on the dashboard's "UI Patol" tab)
+PATROL_PORT="${PATROL_PORT:-8766}"
+if ! lsof -iTCP:$PATROL_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+    nohup $SSH -N -L $PATROL_PORT:localhost:$PATROL_PORT >/dev/null 2>&1 < /dev/null &
     disown || true
     sleep 4
 fi

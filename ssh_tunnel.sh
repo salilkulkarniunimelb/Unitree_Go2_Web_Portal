@@ -20,4 +20,4 @@ echo " Then open http://localhost:7860 in your browser."
 echo "============================================================"
 echo ""
 
-ssh -N -L 7860:localhost:7860 -p "$PORT" "$USER_HOST"
+ssh -N -L 7860:localhost:7860 -L 8766:localhost:8766 -p "$PORT" "$USER_HOST"

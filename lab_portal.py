@@ -1985,6 +1985,24 @@ def main():
                                       outputs=patrol_goal_out)
                 patrol_robot_dd.change(node.set_patrol_robot, patrol_robot_dd, None)
 
+            # ================================================================
+            # TAB 3: UI PATOL (embedded polygon-constrained patrol planner)
+            # The patrol planner runs in the same robot_hivemind container on
+            # port 8766 (host networking). The dashboard embeds it in an
+            # iframe; the port is forwarded by the SSH tunnel just like 7860.
+            # ================================================================
+            with gr.Tab("UI Patol", id="patrol-ui"):
+                gr.Markdown("#### POLYGON-CONSTRAINED PATROL PLANNER")
+                gr.Markdown(
+                    "Draw a patrol region on the map below, run the planner, "
+                    "then dispatch Luna / Astro through the planned checkpoints."
+                )
+                gr.HTML(
+                    '<iframe src="http://localhost:8766/" '
+                    'style="width:100%; height:900px; border:0; '
+                    'border-radius:8px; background:#0b0b12;"></iframe>'
+                )
+
     demo.launch(
         server_name=SERV_NAME,
         server_port=SERV_PORT,
