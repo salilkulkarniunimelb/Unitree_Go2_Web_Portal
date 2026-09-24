@@ -1892,9 +1892,9 @@ def main():
                 robot_dd.change(node.set_robot, robot_dd, None)
 
             # ================================================================
-            # TAB 2: PATROLLING (both robots on one map)
+            # TAB 2: FLEET VIEW (both robots on one map)
             # ================================================================
-            with gr.Tab("Patrolling", id="patrolling"):
+            with gr.Tab("Fleet View", id="patrolling"):
                 # ---------- TOP ROW: GOAL TARGET (L) + FLEET MAP (C) + CAMERA (R) ----------
                 with gr.Row():
                     # LEFT: Goal Target Robot selector
@@ -1991,7 +1991,7 @@ def main():
             # port 8766 (host networking). The dashboard embeds it in an
             # iframe; the port is forwarded by the SSH tunnel just like 7860.
             # ================================================================
-            with gr.Tab("UI Patol", id="patrol-ui"):
+            with gr.Tab("Patrolling", id="patrol-ui"):
                 gr.Markdown("#### POLYGON-CONSTRAINED PATROL PLANNER")
                 gr.Markdown(
                     "Draw a patrol region on the map below, run the planner, "
