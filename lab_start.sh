@@ -50,6 +50,18 @@ start() {
     if [ -f /workspace/hardware_code/ros2_ws/install/setup.bash ]; then
         source /workspace/hardware_code/ros2_ws/install/setup.bash
     fi
+    # Guard: the QOD WebRTC camera consumer (aiortc) and uvicorn both need
+    # websockets >= 10. Debian ships websockets 9.1 in /usr/lib/python3/
+    # dist-packages; if that one wins on import (no websockets.server.
+    # ServerProtocol, breaks the portal + camera), force-reinstall the pip
+    # build into /usr/local so it wins on sys.path.
+    if ! python3 -c \
+        "import websockets;assert int(websockets.__version__.split('.')[0])>=10" 2>/dev/null; then
+        echo "  -> fixing websockets (found \
+$(python3 -c 'import websockets;print(websockets.__version__)' 2>/dev/null || echo missing))..."
+        python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "websockets>=10,<17"
+    fi
     setsid nohup python3 lab_portal.py > "$LOGFILE" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     echo "Started pid $(cat "$PIDFILE"). Waiting for it to serve..."

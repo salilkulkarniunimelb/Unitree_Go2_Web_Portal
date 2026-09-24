@@ -118,12 +118,12 @@ $SSH "docker exec $CONTAINER bash -lc '
     fi
 '"
 
-# --- 5) Ensure QOD WebRTC consumer deps (aiortc, websockets) --------------
+# --- 5) Ensure QOD WebRTC consumer deps (aiortc, websockets, redis) --------------
 echo "[5/7] Ensuring QOD WebRTC camera deps (aiortc, websockets, redis)..."
 $SSH "docker exec $CONTAINER bash -lc '
-    if ! python3 -c \"import aiortc,websockets,redis\" 2>/dev/null; then
-        echo \"  -> installing aiortc + websockets + redis (QOD camera/detection consumers)...\"
-        python3 -m pip install --no-cache-dir \"aiortc>=1.15.0\" websockets redis
+    if ! python3 -c \"import aiortc,websockets,redis\" 2>/dev/null || ! python3 -c \"import websockets;assert int(websockets.__version__.split(chr(46))[0])>=10\" 2>/dev/null; then
+        echo \"  -> installing/fixing aiortc + websockets + redis (QOD camera/detection consumers)...\"
+        python3 -m pip install --no-cache-dir \"aiortc>=1.15.0\" \"websockets>=10,<17\" redis
     else
         echo webrtc-deps-ok
     fi
