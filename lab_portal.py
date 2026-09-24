@@ -269,6 +269,11 @@ DASHBOARD_CSS = """
     .robot-selector{margin-top:10px;}
     #initpose_bridge{pointer-events:none;opacity:0;height:0;overflow:hidden;}
     #initpose_bridge textarea{opacity:0;height:0;min-height:0!important;}
+    #initpose_toggle_btn{font-size:14px !important;font-weight:600 !important;
+        font-family:"Helvetica", "Helvetica Neue", Arial, sans-serif !important;
+        letter-spacing:.2px !important;
+        padding:4px 12px !important;min-height:0 !important;height:auto !important;
+        width:auto !important;border-radius:8px !important;}
 
     /* Blocks / cards */
     .gr-block,.gr-box,.gr-form{background:transparent !important;}
@@ -1775,12 +1780,21 @@ def main():
                     with gr.Column(scale=2, elem_classes=["map-panel"]):
                         gr.Markdown("## Live Mapping")
 
-                        init_toggle = gr.Checkbox(
-                            label="Set Initial Pose — drag on the map (position = start, "
-                                  "orientation = drag direction)",
-                            value=False,
-                            elem_id="initpose_toggle",
-                        )
+                        # "Set Initial Pose" is hidden by default and only revealed
+                        # via the toggle button below, so the map stays clean for
+                        # normal goal-clicking. Hiding also un-checks the toggle so
+                        # the drag gesture is never silently active while hidden.
+                        initpose_btn = gr.Button("Set Initial Pose",
+                                                 elem_id="initpose_toggle_btn")
+                        initpose_visible = gr.State(value=False)
+
+                        with gr.Column(visible=False, elem_id="initpose_section") as initpose_section:
+                            init_toggle = gr.Checkbox(
+                                label="Set Initial Pose — drag on the map (position = start, "
+                                      "orientation = drag direction)",
+                                value=False,
+                                elem_id="initpose_toggle",
+                            )
 
                         map_img = gr.Image(label="Occupancy Map — click to set a nav goal",
                                            type="numpy", elem_id="map_image", height=520)
@@ -1881,6 +1895,23 @@ def main():
                     return node.drag_to_initial((x1, y1), (x2, y2))
 
                 map_img.select(on_map_select, inputs=init_toggle, outputs=goal_out)
+
+                # Reveal / hide the "Set Initial Pose" option. Hiding also forces
+                # the checkbox off so the hidden toggle can't leave the drag
+                # in initial-pose mode while the option is invisible.
+                def toggle_initpose_section(visible):
+                    new_visible = not visible
+                    label = ("Hide Initial Pose Setting" if new_visible
+                             else "Set Initial Pose")
+                    if new_visible:
+                        return new_visible, gr.update(visible=True), gr.update(value=label), gr.skip()
+                    return new_visible, gr.update(visible=False), gr.update(value=label), gr.update(value=False)
+
+                initpose_btn.click(
+                    toggle_initpose_section,
+                    inputs=[initpose_visible],
+                    outputs=[initpose_visible, initpose_section, initpose_btn, init_toggle],
+                )
                 # Exposed as a public Gradio API endpoint ("drag_initial") so the browser
                 # drag JS can POST the payload directly (POST /gradio_api/call/drag_initial
                 # with {"data": [payload, mode]}). This is a deterministic bridge that works
