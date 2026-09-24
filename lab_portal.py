@@ -127,6 +127,27 @@ QOD_SIGNALING_URL = os.getenv(
     "QOD_SIGNALING_URL", "ws://127.0.0.1:8000/ws/signaling"
 )
 
+# -------------------- QOD detection overlay -------------------------
+# The qod cv-worker runs YOLO on each robot's WebRTC feed and publishes the
+# boxes to Redis channel "detections:<source>"; the qod website draws them on a
+# canvas. Subscribing to the same channel lets us draw the identical overlay on
+# the dashboard camera. Set LAB_DETECTIONS=0 to disable.
+DETECTIONS_ENABLED = os.getenv("LAB_DETECTIONS", "1").strip().lower() != "0"
+REDIS_URL = os.getenv("QOD_DETECTIONS_REDIS_URL", "redis://127.0.0.1:6379")
+# Only draw boxes the cv-worker already published (it filters at 0.25 -> 0.5);
+# this guards the overlay against noise-tolerant thresholds.
+DETECTIONS_MIN_CONF = float(os.getenv("LAB_DETECTIONS_MIN_CONF", "0.25"))
+# Same class->style mapping as frontend/src/Services/detection-class-style.ts.
+# NOTE: tuples are RGB, matching the (BGR-in-cv2-displayed-as-RGB) convention
+# used by ROBOT_COLORS above (channel 0 = red on screen).
+DETECTION_CLASS_STYLES = {
+    "jerry":  dict(alias="Jerry can",      color=(255, 59, 48)),   # #ff3b30
+    "spill":  dict(alias="Chemical spill", color=(34, 197, 94)),   # #22c55e
+    "wire":   dict(alias="Exposed wire",   color=(168, 85, 247)),  # #a855f7
+    "rubble": dict(alias="Debris",         color=(59, 130, 246)),  # #3b82f6
+}
+DEFAULT_DETECTION_STYLE = dict(alias="Object", color=(53, 255, 101))  # #35ff65
+
 FT_FRAME = "map"
 
 # Once the robot gets this close (meters) to the active goal, consider it
@@ -520,6 +541,7 @@ class RobotState:
         self._cam_frames = deque(maxlen=CAM_FRAMES_MAX)  # smooth-playback buffer
         self._last_decode = 0.0
         self._stop_cam = False
+        self._qod_detections = None  # QodDetectionsSubscriber (webrtc mode only)
         # Camera decode strategy: the Go2 H.264 stream is fragmented across many
         # small ROS messages, so a persistent ffmpeg pipe can never stay in sync
         # (constant "no frame!" / "non-existing PPS"). Instead we buffer bytes,
@@ -531,6 +553,7 @@ class RobotState:
             # website shows). Decoded BGR frames arrive via _on_qod_frame and are
             # queued into the same _cam_frames deck draw_camera() plays back.
             self._qod_consumer = None
+            self._qod_detections = None
             qod_source = self.topics.get("source")
             if qod_source:
                 try:
@@ -550,6 +573,22 @@ class RobotState:
                     self.node.get_logger().error(
                         f"[{self.name}] failed to start QOD camera consumer: {e}"
                     )
+                if DETECTIONS_ENABLED:
+                    try:
+                        from web_backend.qod_detections import (
+                            QodDetectionsSubscriber,
+                        )
+                        self._qod_detections = QodDetectionsSubscriber(
+                            source_id=qod_source,
+                            name=self.name,
+                            redis_url=REDIS_URL,
+                        )
+                        self._qod_detections.start()
+                    except Exception as e:
+                        self.node.get_logger().error(
+                            f"[{self.name}] failed to start QOD detections "
+                            f"subscriber: {e}"
+                        )
         else:
             threading.Thread(target=self._camera_decode_loop, daemon=True).start()
         # --- battery / imu ---
@@ -784,10 +823,14 @@ class RobotState:
             self.node.get_logger().error(f"Camera buffer failed: {e}")
 
     def _on_qod_frame(self, frame):
-        """Queue a decoded BGR frame from the QOD WebRTC consumer for smooth
+        """Queue a decoded frame from the QOD WebRTC consumer for smooth
         playback. draw_camera() pops from the same _cam_frames deck used by the
-        ROS decode path, so the UI code is shared."""
+        ROS decode path, so the UI code is shared. The consumer hands us BGR;
+        Gradio's gr.Image component displays RGB, so convert here once (this is
+        what caused the blue tint)."""
         try:
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = frame.shape[:2]
             if w > CAM_W or h > CAM_H:
                 frame = cv2.resize(frame, (CAM_W, CAM_H),
@@ -1051,6 +1094,65 @@ class RobotState:
                         0.7, (0, 0, 0), 2)
         return canvas
 
+    def _draw_detections(self, frame):
+        """Draw the qod cv-worker's object detections on the camera frame -
+        the exact same stream (Redis channel detections:<source>) and class
+        styling the qod website uses, so both UIs match. Boxes arrive
+        normalized 0..1 relative to the original 1280x720 feed; the displayed
+        frame keeps the same aspect ratio, so we scale linearly to its size."""
+        sub = getattr(self, "_qod_detections", None)
+        payload = sub.detections() if sub is not None else []
+        if not payload:
+            return frame
+        h, w = frame.shape[:2]
+        outer = max(2, w // 170)   # dark under-stroke
+        inner = max(1, outer - 1)  # coloured core - same look as the site
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for det in payload:
+            try:
+                cls = str(det.get("class") or "").strip().lower()
+                conf = float(det.get("confidence") or 0.0)
+                if conf < DETECTIONS_MIN_CONF:
+                    continue
+                bbox = det.get("bbox") or {}
+                x = float(bbox["x"])
+                y = float(bbox["y"])
+                bw = float(bbox["width"])
+                bh = float(bbox["height"])
+                # The site accepts normalized (0..1) boxes and also raw pixel
+                # boxes; we only draw normalized ones, like the YOLO publisher.
+                if not (0 <= x <= 1.1 and 0 <= y <= 1.1 and
+                        0 <= bw <= 1.1 and 0 <= bh <= 1.1):
+                    continue
+                style = DETECTION_CLASS_STYLES.get(
+                    cls, DEFAULT_DETECTION_STYLE
+                )
+                label = f"{style['alias']} {conf * 100:.0f}%"
+                px = int(x * w)
+                py = int(y * h)
+                pw = max(1, int(bw * w))
+                ph = max(1, int(bh * h))
+                pt1 = (px, py)
+                pt2 = (px + pw, py + ph)
+                cv2.rectangle(frame, pt1, pt2, (0, 0, 0), outer)
+                cv2.rectangle(frame, pt1, pt2, style["color"], inner)
+                (tw, th), baseline = cv2.getTextSize(
+                    label, font, 0.45, 1
+                )
+                lx = px
+                ly = max(0, py - (th + baseline + 4))
+                cv2.rectangle(
+                    frame, (lx, ly), (lx + tw + 6, ly + th + 6),
+                    (0, 0, 0), -1,
+                )
+                cv2.putText(
+                    frame, label, (lx + 3, ly + th + 2), font, 0.45,
+                    (255, 255, 255), 1, cv2.LINE_AA,
+                )
+            except Exception:
+                continue
+        return frame
+
     def draw_camera(self):
         # Play smoothly from the decoded frame queue (refilled in the
         # background). When it runs dry, hold the last frame until the next
@@ -1073,7 +1175,7 @@ class RobotState:
         h, w = frame.shape[:2]
         if w > 640 or h > 360:
             frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-        return frame
+        return self._draw_detections(frame)
 
     # ---------------------- text getters ----------------------
     def get_battery_data(self):
@@ -1306,7 +1408,8 @@ class LabRobotNode(Node):
                         f"plan={'y' if robot.planner_path and len(robot.planner_path) >= 2 else 'n'} "
                         f"plan_pts={len(robot.planner_path) if robot.planner_path else 0} "
                         f"pose_txt={robot.pose_latest!r} cam_frame={'y' if robot.color_frame is not None else 'n'} "
-                        f"cam_ts={robot.cam_frame_ts:.1f} cam_fps={robot.cam_fps:.2f}"
+                        f"cam_ts={robot.cam_frame_ts:.1f} cam_fps={robot.cam_fps:.2f} "
+                        f"det={len(robot._qod_detections.detections()) if getattr(robot, '_qod_detections', None) else 'n/a'}"
                     )
             except Exception as e:
                 self.get_logger().error(f"[DIAG] failed: {e}")

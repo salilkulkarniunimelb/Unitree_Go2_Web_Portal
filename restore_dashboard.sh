@@ -26,7 +26,7 @@ IMAGE="${IMAGE:-unimelb-humble:dashboard}"   # snapshot: code + deps + boot.sh b
 ENTRYPOINT="bash /workspace/boot.sh"
 PORT=7860
 FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh"
-WEB_BACKEND_FILE="web_backend/qod_consumer.py"
+WEB_BACKEND_FILES="web_backend/qod_consumer.py web_backend/qod_detections.py"
 
 SSH="ssh -o BatchMode=yes $SERVER"
 SCP="scp -o BatchMode=yes"
@@ -62,13 +62,17 @@ for f in $FILES; do
     $SSH "docker cp /tmp/$f $CONTAINER:/workspace/$f"
 done
 $SSH "docker exec $CONTAINER chmod +x /workspace/lab_start.sh /workspace/start_dashboard.sh /workspace/boot.sh"
-# The QOD WebRTC camera consumer module (used by lab_portal.py).
-if [ -f "$WEB_BACKEND_FILE" ]; then
-    echo "  -> Copying $WEB_BACKEND_FILE into container..."
-    $SSH "docker exec $CONTAINER mkdir -p /workspace/web_backend"
-    $SCP "$WEB_BACKEND_FILE" "$SERVER:/tmp/qod_consumer.py"
-    $SSH "docker cp /tmp/qod_consumer.py $CONTAINER:/workspace/web_backend/qod_consumer.py"
-fi
+# The QOD WebRTC camera consumer + detection-subscriber modules (used by
+# lab_portal.py).
+$SSH "docker exec $CONTAINER mkdir -p /workspace/web_backend"
+for wf in $WEB_BACKEND_FILES; do
+    if [ -f "$wf" ]; then
+        bn=$(basename "$wf")
+        echo "  -> Copying $wf into container..."
+        $SCP "$wf" "$SERVER:/tmp/$bn"
+        $SSH "docker cp /tmp/$bn $CONTAINER:/workspace/web_backend/$bn"
+    fi
+done
 # The dashboard logo and any assets are served from the container, so copy
 # the whole assets/ folder (missing logo caused a FileNotFoundError crash).
 if [ -d assets ]; then
@@ -115,11 +119,11 @@ $SSH "docker exec $CONTAINER bash -lc '
 '"
 
 # --- 5) Ensure QOD WebRTC consumer deps (aiortc, websockets) --------------
-echo "[5/7] Ensuring QOD WebRTC camera deps (aiortc, websockets)..."
+echo "[5/7] Ensuring QOD WebRTC camera deps (aiortc, websockets, redis)..."
 $SSH "docker exec $CONTAINER bash -lc '
-    if ! python3 -c \"import aiortc,websockets\" 2>/dev/null; then
-        echo \"  -> installing aiortc + websockets (QOD camera consumer)...\"
-        python3 -m pip install --no-cache-dir \"aiortc>=1.15.0\" websockets
+    if ! python3 -c \"import aiortc,websockets,redis\" 2>/dev/null; then
+        echo \"  -> installing aiortc + websockets + redis (QOD camera/detection consumers)...\"
+        python3 -m pip install --no-cache-dir \"aiortc>=1.15.0\" websockets redis
     else
         echo webrtc-deps-ok
     fi
