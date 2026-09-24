@@ -200,6 +200,39 @@ class Nav2MapWithRobot(Node):
 
         return canvas
 
+    def click_to_world(self, px, py):
+        """Convert a click in the rotated Gradio canvas image to map-frame world coords.
+
+        The draw_gradio() canvas is 800x800 and is rotated 90deg CLOCKWISE before
+        display. This mirrors the transform used in get_raw_map() (the inverse of the
+        world->pixel mapping there) so a click lands on the correct map location.
+        """
+        if self.map_info is None or self.robot_pose is None:
+            return None, None
+
+        canvas_size = 800
+        scale = self.cached_scale
+        origin_x, origin_y, h, ox, oy = self.cached_origin
+        res = self.map_info.resolution
+
+        # The displayed image is the 800x800 canvas rotated 90deg CLOCKWISE.
+        # Forward (draw_gradio): displayed (px,py) = (cy, canvas_size-1-cx).
+        # Inverse: original canvas coords:
+        cx = canvas_size - 1 - float(py)
+        cy = float(px)
+
+        # Undo canvas centering / scaling (map placed into the 800x800 canvas).
+        mx = (cx - ox) / scale
+        my = (cy - oy) / scale
+
+        # Undo the Y-flip from draw_gradio (my = h - 1 - my) for map pixel row.
+        my = h - 1 - my
+
+        # Back to world coordinates.
+        wx = mx * res + origin_x
+        wy = my * res + origin_y
+        return wx, wy
+
     def get_raw_map(self):
         if self.map_info is None or self.map is None:
             return None
