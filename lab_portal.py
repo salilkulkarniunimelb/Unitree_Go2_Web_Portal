@@ -1758,8 +1758,7 @@ def main():
                         # Luna card
                         with gr.Group(elem_classes=["robot-card"]):
                             with gr.Row():
-                                gr.Markdown("### Luna")
-                                gr.Markdown("🟢 Connected")
+                                gr.HTML('<div style="display:flex;justify-content:space-between;align-items:center;"><h3 style="margin:0;">Luna</h3><div>🟢 Connected</div></div>')
                             luna_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
                             luna_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
                             luna_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
@@ -1767,23 +1766,14 @@ def main():
                         # Astro card
                         with gr.Group(elem_classes=["robot-card"]):
                             with gr.Row():
-                                gr.Markdown("### Astro")
-                                gr.Markdown("🟢 Connected")
+                                gr.HTML('<div style="display:flex;justify-content:space-between;align-items:center;"><h3 style="margin:0;">Astro</h3><div>🟢 Connected</div></div>')
                             astro_map_status = gr.Textbox(label="Map", lines=1, interactive=False)
                             astro_pose_status = gr.Textbox(label="Pose", lines=1, interactive=False)
                             astro_cam_status = gr.Textbox(label="Camera", lines=1, interactive=False)
 
-                        gr.Markdown("#### FUTURE: MISSION CONTROLS")
-                        with gr.Group(elem_classes=["mission-buttons"]):
-                            with gr.Row():
-                                gr.Button("🎯 Start Mapping", interactive=False)
-                            with gr.Row():
-                                gr.Button("🚀 Start Mission", interactive=False)
-                                gr.Button("⏹ Stop", interactive=False)
-
                     # ---------- CENTER: LIVE 3D MAPPING ----------
                     with gr.Column(scale=2, elem_classes=["map-panel"]):
-                        gr.Markdown("## Live Mapping")
+                        gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Live Mapping</h2>')
 
                         # "Set Initial Pose" is hidden by default and only revealed
                         # via the toggle button below, so the map stays clean for
@@ -1811,12 +1801,12 @@ def main():
                             init_bridge = gr.Textbox(visible=True, show_label=False,
                                                      elem_id="initpose_bridge", scale=0)
 
-                        gr.Markdown("**Legend:** 🔴 **Luna** (red dot · red route) · 🟦 **Astro** (blue dot · blue route) · black arrow = heading · **orange target = goal (route clears on arrival)** · blue = explored · dark = walls")
+                        gr.HTML('<div style="text-align:center;">🔴 Luna · 🟦 Astro</div>')
 
                     # ---------- RIGHT: LIVE CAMERA ----------
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
-                        gr.Markdown("## Live Camera")
-                        cam_img = gr.Image(label="Forward Camera — selected robot",
+                        gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Live Camera</h2>')
+                        cam_img = gr.Image(label="Camera: selected robot",
                                            type="numpy", height=300)
                         cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
 
@@ -1946,45 +1936,21 @@ def main():
 
                     # CENTER: Fleet Patrolling Map (both robots)
                     with gr.Column(scale=2, elem_classes=["map-panel"]):
-                        gr.Markdown("## Fleet Patrolling Map")
+                        gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Fleet Patrolling Map</h2>')
                         patrol_map_img = gr.Image(
                             show_label=False, type="numpy", elem_id="patrol_map_image", height=520)
-                        gr.Markdown(
-                            "**Legend:** 🔴 **Luna** (red dot, red route) · "
-                            "🟦 **Astro** (blue dot, blue route) — black arrow = heading · "
-                            "**orange target = goal (route clears on arrival)**")
+                        gr.HTML('<div style="text-align:center;">🔴 Luna · 🟦 Astro</div>')
+                        patrol_goal_out = gr.Textbox(label="Goal Status", lines=1, interactive=False)
 
                     # RIGHT: Fleet Camera — streams from BOTH robots
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
-                        gr.Markdown("## Fleet Camera")
+                        gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Fleet Camera</h2>')
                         patrol_cam_luna = gr.Image(
                             label="Luna — Forward Camera", type="numpy", height=250)
                         patrol_cam_astro = gr.Image(
                             label="Astro — Forward Camera", type="numpy", height=250)
 
-                # ---------- SECTION 2: FLEET OVERVIEW / GOAL ROUTING / FUTURE ----------
-                with gr.Row():
-                    with gr.Column(scale=1, elem_classes=["fleet-panel"]):
-                        with gr.Group(elem_classes=["robot-card"]):
-                            gr.Markdown("### Fleet Overview")
-                            gr.Markdown(
-                                "**Luna** 🔴 (red) · **Astro** 🟦 (blue)\n\n"
-                                "Both robots are shown together. Click the map to send "
-                                "a nav goal to the robot selected in **Goal Target Robot**."
-                            )
-                    with gr.Column(scale=1, elem_classes=["fleet-panel"]):
-                        with gr.Group(elem_classes=["robot-card"]):
-                            gr.Markdown("### Goal Routing")
-                            patrol_goal_out = gr.Textbox(
-                                label="Patrol Goal Status", lines=2, interactive=False)
-                    with gr.Column(scale=1, elem_classes=["fleet-panel"]):
-                        gr.Markdown("#### FUTURE: PATROL ROUTES")
-                        with gr.Group(elem_classes=["mission-buttons"]):
-                            with gr.Row():
-                                gr.Button("📍 Add Waypoint", interactive=False)
-                                gr.Button("🚀 Start Patrol", interactive=False)
-
-                # ---------- SECTION 3: FLEET TELEMETRY (BOTH ROBOTS) ----------
+                # ---------- SECTION 2: FLEET TELEMETRY (BOTH ROBOTS) ----------
                 with gr.Row():
                     with gr.Column(scale=1, elem_classes=["fleet-panel"]):
                         patrol_conn_luna = gr.Textbox(
