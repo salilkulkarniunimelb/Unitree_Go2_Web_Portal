@@ -228,6 +228,11 @@ def _placeholder(w, h, text, color=(56, 189, 248)):
     return ph
 
 
+def _blank(w, h):
+    """Solid dark blank frame with no text (used for the map area when no data)."""
+    return np.ones((h, w, 3), dtype=np.uint8) * 12
+
+
 _LOGO_URI = None
 
 
@@ -1099,7 +1104,7 @@ class RobotState:
     # ---------------------- rendering ----------------------
     def draw_map(self):
         if self.cached_map_img is None:
-            return _placeholder(640, 480, f"WAITING FOR {self.name.upper()} MAP...")
+            return _blank(640, 480)
 
         canvas = self.cached_map_img.copy()
         scale = self.cached_scale
@@ -1591,7 +1596,7 @@ class LabRobotNode(Node):
                 base = r
                 break
         if base is None:
-            return _placeholder(640, 480, "WAITING FOR MAP DATA...")
+            return _blank(640, 480)
 
         canvas = base.cached_map_img.copy()
         scale = base.cached_scale
@@ -1796,7 +1801,7 @@ def main():
                                 elem_id="initpose_toggle",
                             )
 
-                        map_img = gr.Image(label="Occupancy Map — click to set a nav goal",
+                        map_img = gr.Image(show_label=False,
                                            type="numpy", elem_id="map_image", height=520)
                         goal_out = gr.Textbox(label="Goal Status", lines=1)
 
@@ -1943,8 +1948,7 @@ def main():
                     with gr.Column(scale=2, elem_classes=["map-panel"]):
                         gr.Markdown("## Fleet Patrolling Map")
                         patrol_map_img = gr.Image(
-                            label="Occupancy Map — both robots · click to set a nav goal",
-                            type="numpy", elem_id="patrol_map_image", height=520)
+                            show_label=False, type="numpy", elem_id="patrol_map_image", height=520)
                         gr.Markdown(
                             "**Legend:** 🔴 **Luna** (red dot, red route) · "
                             "🟦 **Astro** (blue dot, blue route) — black arrow = heading · "
