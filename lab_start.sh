@@ -13,6 +13,8 @@ LOGFILE=/workspace/lab_portal.log
 PORT=7860
 # Match the portal process (lab_portal.py), NOT this script's own command line.
 PROC="python3 .*lab_portal.py"
+# Server/LAN IP (container uses host networking, so this is the server's IP).
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 kill_pids() {
     # Kill any live portal processes found by pattern (ignore the grep itself).
@@ -45,6 +47,23 @@ start() {
         return 1
     fi
     source /opt/ros/humble/setup.bash
+    # Also source the hardware ROS2 workspace (provides unitree_go msg types)
+    # used for the H.264 front-camera stream. Optional if not present.
+    if [ -f /workspace/hardware_code/ros2_ws/install/setup.bash ]; then
+        source /workspace/hardware_code/ros2_ws/install/setup.bash
+    fi
+    # Guard: the QOD WebRTC camera consumer (aiortc) and uvicorn both need
+    # websockets >= 10. Debian ships websockets 9.1 in /usr/lib/python3/
+    # dist-packages; if that one wins on import (no websockets.server.
+    # ServerProtocol, breaks the portal + camera), force-reinstall the pip
+    # build into /usr/local so it wins on sys.path.
+    if ! python3 -c \
+        "import websockets;assert int(websockets.__version__.split('.')[0])>=10" 2>/dev/null; then
+        echo "  -> fixing websockets (found \
+$(python3 -c 'import websockets;print(websockets.__version__)' 2>/dev/null || echo missing))..."
+        python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "websockets>=10,<17"
+    fi
     setsid nohup python3 lab_portal.py > "$LOGFILE" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     echo "Started pid $(cat "$PIDFILE"). Waiting for it to serve..."
@@ -53,7 +72,7 @@ start() {
             # confirm the process is actually still alive (not a stale listener)
             pid=$(cat "$PIDFILE")
             if kill -0 "$pid" 2>/dev/null; then
-                echo "UP -> http://localhost:$PORT"
+                echo "UP -> http://localhost:$PORT (this server: http://${LAN_IP:-10.4.48.11}:$PORT)"
                 return 0
             else
                 echo "Port responded but pid $pid is gone. Check $LOGFILE"
@@ -82,7 +101,7 @@ stop() {
 status() {
     if is_up; then
         pid=$(cat "$PIDFILE" 2>/dev/null)
-        echo "UP -> http://localhost:$PORT (pid ${pid:-?})"
+        echo "UP -> http://localhost:$PORT (this server: http://${LAN_IP:-10.4.48.11}:$PORT) (pid ${pid:-?})"
         tail -3 "$LOGFILE"
     else
         echo "Not serving on port $PORT."

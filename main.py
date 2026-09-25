@@ -1,5 +1,6 @@
 import gradio as gr
 import threading
+import base64
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from web_backend.data_stream import DataStream
@@ -38,6 +39,11 @@ def upload_file(file):
 def load_css_file(path):
     with open(path, "r") as f:
         return f.read()
+
+def logo_data_uri():
+    with open("assets/logo.png", "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:image/png;base64,{b64}"
 
 # -------------------- Gradio UI --------------------------
 def main():
@@ -86,7 +92,14 @@ def main():
         title="MCP Web",
     ) as demo:
         
-        gr.Markdown(f""" ROBOT `{ROBOT}` | ROSBRIDGE_ADDRESS `{ROSBRIDGE_IP}:{ROSBRIDGE_PORT}` | BACKEND_MODE `{MODE}` | INTERFACE `{INTERFACE}`""")
+        gr.HTML(f"""
+        <div style="display:flex; align-items:center; gap:12px; padding:8px 4px;">
+            <img src="{logo_data_uri()}" alt="logo" style="height:40px; width:auto;" />
+            <div style="font-size:15px;">
+                ROBOT <code>{ROBOT}</code> &nbsp;|&nbsp; ROSBRIDGE_ADDRESS <code>{ROSBRIDGE_IP}:{ROSBRIDGE_PORT}</code> &nbsp;|&nbsp; BACKEND_MODE <code>{MODE}</code> &nbsp;|&nbsp; INTERFACE <code>{INTERFACE}</code>
+            </div>
+        </div>
+        """)
 
         with gr.Tabs():
 
