@@ -13,6 +13,8 @@ LOGFILE=/workspace/lab_portal.log
 PORT=7860
 # Match the portal process (lab_portal.py), NOT this script's own command line.
 PROC="python3 .*lab_portal.py"
+# Server/LAN IP (container uses host networking, so this is the server's IP).
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 kill_pids() {
     # Kill any live portal processes found by pattern (ignore the grep itself).
@@ -70,7 +72,7 @@ $(python3 -c 'import websockets;print(websockets.__version__)' 2>/dev/null || ec
             # confirm the process is actually still alive (not a stale listener)
             pid=$(cat "$PIDFILE")
             if kill -0 "$pid" 2>/dev/null; then
-                echo "UP -> http://localhost:$PORT"
+                echo "UP -> http://localhost:$PORT (this server: http://${LAN_IP:-10.4.48.11}:$PORT)"
                 return 0
             else
                 echo "Port responded but pid $pid is gone. Check $LOGFILE"
@@ -99,7 +101,7 @@ stop() {
 status() {
     if is_up; then
         pid=$(cat "$PIDFILE" 2>/dev/null)
-        echo "UP -> http://localhost:$PORT (pid ${pid:-?})"
+        echo "UP -> http://localhost:$PORT (this server: http://${LAN_IP:-10.4.48.11}:$PORT) (pid ${pid:-?})"
         tail -3 "$LOGFILE"
     else
         echo "Not serving on port $PORT."
