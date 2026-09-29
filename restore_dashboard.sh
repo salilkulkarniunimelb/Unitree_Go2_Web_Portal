@@ -140,31 +140,149 @@ else
 fi
 
 echo "  -> Waiting for the portal to answer on port $PORT..."
+# --fail matters: without it a Gradio 500 still exits 0 and we would report a
+# broken portal as UP.
+PORTAL_UP=0
 for i in $(seq 1 30); do
-    if $SSH "curl -s --noproxy '*' -o /dev/null http://$HOST:$PORT/ 2>/dev/null"; then
+    if $SSH "curl -fsS --noproxy '*' -o /dev/null -m 5 http://$HOST:$PORT/ 2>/dev/null"; then
         echo "  -> Portal is UP."
+        PORTAL_UP=1
         break
     fi
     sleep 2
 done
+if [ "$PORTAL_UP" != "1" ]; then
+    echo ""
+    echo "ERROR: the portal never answered on $HOST:$PORT (gave up after 60s)."
+    echo "Last 25 log lines from the container:"
+    $SSH "docker exec $CONTAINER bash -lc 'tail -25 /workspace/lab_portal.log'" || true
+    exit 1
+fi
 
 # --- 7) Tunnel + open browser --------------------------------------------------
-echo "[7/7] Opening SSH tunnels..."
-if ! lsof -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
-    nohup $SSH -N -L $PORT:localhost:$PORT >/dev/null 2>&1 < /dev/null &
-    disown || true
-    sleep 4
-fi
-# Patrol planner UI (embedded on the dashboard's "UI Patol" tab)
 PATROL_PORT="${PATROL_PORT:-8766}"
-if ! lsof -iTCP:$PATROL_PORT -sTCP:LISTEN >/dev/null 2>&1; then
-    nohup $SSH -N -L $PATROL_PORT:localhost:$PATROL_PORT >/dev/null 2>&1 < /dev/null &
+
+# A local port being LISTENing is NOT proof of a working tunnel: an `ssh -N -L`
+# orphaned by a VPN drop keeps the port bound while forwarding nowhere, and the
+# old `if ! lsof ...` check treated that as "tunnel already up" and skipped it.
+# The dashboard then looked dead even though the script printed DONE.
+tunnel_is_live() {
+    pids=$(lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null || true)
+    [ -n "$pids" ] || return 1
+    ps -p $pids -o comm= 2>/dev/null | grep -q 'ssh'
+}
+
+# Replace whatever squats on the port, then forward it and wait for a real ssh
+# listener instead of a fixed sleep.
+#   $3 verify: "http"   -> also prove real bytes come through the tunnel
+#               "listen" -> a bound ssh listener is enough
+#   $4 reclaim: "ours"   -> kill any squatter, this port is ours alone
+#                "ssh"   -> only replace a stale ssh tunnel, never touch a
+#                            real process (the patrol planner may be running
+#                            locally on purpose)
+open_tunnel() {
+    _port="$1"
+    _name="$2"
+    _verify_http="$3"
+    _reclaim="${4:-ssh}"
+    if tunnel_is_live "$_port"; then
+        if [ "$_verify_http" != "http" ]; then
+            echo "  -> Tunnel for $_name (:$_port) is already live, reusing it."
+            return 0
+        fi
+        # A bound ssh listener can still be forwarding nowhere (orphaned by a
+        # VPN drop), so for the dashboard prove it with real bytes before
+        # trusting it, and rebuild it if it does not answer.
+        if curl -fsS --noproxy '*' -o /dev/null -m 5 "http://localhost:$_port/" 2>/dev/null; then
+            echo "  -> Tunnel for $_name (:$_port) is already live and serving, reusing it."
+            return 0
+        fi
+        echo "  -> Existing tunnel on $_port is bound but NOT serving. Rebuilding it..."
+        _stale=$(lsof -tiTCP:"$_port" -sTCP:LISTEN 2>/dev/null || true)
+        kill $_stale 2>/dev/null || true
+        sleep 1
+        kill -9 $_stale 2>/dev/null || true
+    fi
+    _squatters=$(lsof -tiTCP:"$_port" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$_squatters" ]; then
+        if [ "$_reclaim" = "ours" ]; then
+            echo "  -> Port $_port held by a dead listener (pids: $(echo $_squatters | tr '\n' ' ')). Reclaiming it..."
+            kill $_squatters 2>/dev/null || true
+            sleep 1
+            kill -9 $_squatters 2>/dev/null || true
+        else
+            # Only ssh squatters are ours to remove; anything else could be a
+            # process the operator started by hand, so leave it alone.
+            _stale=""
+            for _p in $_squatters; do
+                if ps -p "$_p" -o comm= 2>/dev/null | grep -q 'ssh'; then
+                    _stale="$_stale $_p"
+                fi
+            done
+            if [ -n "$_stale" ]; then
+                echo "  -> Stale ssh tunnel on $_port (pids:$(echo $_stale)). Reclaiming it..."
+                kill $_stale 2>/dev/null || true
+                sleep 1
+                kill -9 $_stale 2>/dev/null || true
+            fi
+            if [ -n "$(lsof -tiTCP:"$_port" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+                echo "  -> Port $_port is held by a real (non-ssh) process; leaving it alone."
+                echo "     Not tunnelling $_name - stop that process first if you want the tunnel."
+                return 1
+            fi
+        fi
+    fi
+    nohup $SSH -N -L "$_port:localhost:$_port" >/dev/null 2>&1 < /dev/null &
     disown || true
-    sleep 4
+    for i in $(seq 1 15); do
+        if tunnel_is_live "$_port"; then
+            if [ "$_verify_http" = "http" ]; then
+                # End-to-end proof: real bytes through the tunnel.
+                for j in $(seq 1 10); do
+                    if curl -fsS --noproxy '*' -o /dev/null -m 5 "http://localhost:$_port/" 2>/dev/null; then
+                        echo "  -> Tunnel for $_name verified: http://localhost:$_port"
+                        return 0
+                    fi
+                    sleep 1
+                done
+                echo "  -> ERROR: tunnel for $_name is open but http://localhost:$_port did not respond."
+                return 1
+            fi
+            echo "  -> Tunnel for $_name open: http://localhost:$_port"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  -> ERROR: could not establish the tunnel for $_name (:$_port)."
+    return 1
+}
+
+echo "[7/7] Opening SSH tunnels..."
+TUNNEL_OK=0
+if open_tunnel "$PORT" "dashboard" http ours; then
+    TUNNEL_OK=1
+fi
+# The patrol planner is embedded as an iframe on the "Patrolling" tab and is
+# started separately (by hand, in its own terminal), so all this needs to do is
+# forward the port. "ssh" reclaim mode: a real process already on 8766 is left
+# untouched, so a planner you started locally is never killed by this script.
+if open_tunnel "$PATROL_PORT" "patrol planner" listen ssh; then
+    echo "  -> Start the patrol planner separately for the 'Patrolling' tab to render."
 fi
 
 echo ""
-echo "DONE. Dashboard restored and auto-start enabled."
-echo "  -> http://localhost:$PORT       (tunneled, this laptop)"
-echo "  -> http://$HOST:$PORT     (anyone on the network)"
-exit 0
+if [ "$TUNNEL_OK" = "1" ]; then
+    echo "DONE. Dashboard restored, tunneled and serving the latest code."
+    echo "  -> http://localhost:$PORT       (tunneled, this laptop)"
+    echo "  -> http://$HOST:$PORT     (anyone on the network)"
+    if command -v open >/dev/null 2>&1; then
+        open "http://localhost:$PORT"
+        echo "  -> Opened http://localhost:$PORT in your browser."
+    fi
+    exit 0
+fi
+
+echo "ERROR: the dashboard is running on the server but the local tunnel failed."
+echo "  -> It is still reachable over the network at http://$HOST:$PORT"
+echo "  -> Or re-run this script; it reclaims the stale local port automatically."
+exit 1
