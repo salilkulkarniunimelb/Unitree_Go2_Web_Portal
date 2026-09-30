@@ -184,6 +184,31 @@ echo "  -> Container restarted (runs the boot.sh we just copied in)."
 # dashboard is the thing being restored here, and a missing key costs one
 # button, not the portal. Loud, though -- a silently broken button is worse.
 echo "[6b/7] Installing the explorer button's restricted SSH key (as $EXPLORER_SSH)..."
+
+# 6b-1: deploy the forced-command script itself FIRST.
+# authorized_keys pins command=".../scripts/dashboard/explorer_host.sh", so if
+# that file is absent every Start Exploring press dies with
+#   bash: line 1: .../explorer_host.sh: No such file or directory
+# It lives in the robot owner's repo, where it is UNTRACKED, so a `git clean -fd`
+# by anyone working in that repo silently deletes it and the button stops. The
+# copy in THIS repo is tracked, so re-pipe it over on every restore rather than
+# trusting host state. Must happen before install_explorer_key.sh, which
+# hard-fails if the script is not executable.
+if [ -f scripts/dashboard/explorer_host.sh ]; then
+    HOST_WRAPPER='$HOME/unimelb_project/hardware_code/scripts/dashboard/explorer_host.sh'
+    if WRAP_OUT=$(ssh -o BatchMode=yes "$EXPLORER_SSH" \
+                   "mkdir -p \$(dirname $HOST_WRAPPER) && cat > $HOST_WRAPPER && chmod +x $HOST_WRAPPER && echo deployed" \
+                   < scripts/dashboard/explorer_host.sh 2>&1) && \
+       echo "$WRAP_OUT" | grep -q deployed; then
+        echo "    [host-wrapper] deployed explorer_host.sh -> $HOST_WRAPPER"
+    else
+        echo "$WRAP_OUT" | sed 's/^/    [host-wrapper] /'
+        echo "    [host-wrapper] WARNING: could not deploy explorer_host.sh; the Start Exploring button will fail."
+    fi
+else
+    echo "    [host-wrapper] WARNING: scripts/dashboard/explorer_host.sh missing from this repo."
+fi
+
 if [ -f scripts/dashboard/install_explorer_key.sh ]; then
     # Deliberately NOT $SCP/$SSH: those already embed $SERVER, so appending
     # $EXPLORER_SSH yields two destinations and ssh runs the second as a remote
