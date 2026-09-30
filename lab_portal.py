@@ -22,7 +22,17 @@ Layout mirrors the Hivemind mission dashboard:
     - Workflow stepper (mapping -> scenario -> localisation -> operations)
     - Robot fleet panel (Luna / Astro cards with live status)
     - Live occupancy map (center) + live camera (right)
+    - Explorer controls (Start/Stop Exploring) + log tail
     - Telemetry + status footer
+
+"Start Exploring" runs the split-compute explorer for the robot selected in the
+fleet panel: it starts that robot's Zenoh bridge, builds go2_hardware_autonomy
++ orchestrator, then launches go2_explorer_splitcomp_server_launch.py. This
+container cannot do any of that itself -- it has no volume mounts and no ROS
+workspace -- so explorer_control.py drives the server host over a restricted
+SSH key that is pinned to one forced-command script, and the build and launch
+happen in the robot_hivemind_luna container. The launch is detached once
+started, so exploration survives the browser closing or the portal restarting.
 
 Working features stream live (map, camera, battery, pose). Features not yet
 implemented (scenario/operations steps, 3D Foxglove view, ROS gateway, 5G
@@ -54,6 +64,20 @@ import cv2
 import numpy as np
 
 import gradio as gr
+
+# Dashboard-side control of the split-compute explorer ("Start Exploring").
+# Imported defensively: this file IS the dashboard and boot.sh restarts it on
+# any exit, so a missing or renamed module would turn a deploy slip into a
+# portal that crash-loops instead of one that still serves the map. If the
+# import fails the explorer buttons report it and the rest of the page is
+# unaffected.
+try:
+    import explorer_control
+except Exception as _exc:  # noqa: BLE001 - must never take the dashboard down
+    explorer_control = None
+    EXPLORER_IMPORT_ERROR = repr(_exc)
+else:
+    EXPLORER_IMPORT_ERROR = None
 
 # ----------------------- Topic names (lab-real) -----------------------
 # Topics actually publishing on the lab server (verified via ros2 topic list).
@@ -1811,6 +1835,44 @@ def main():
                         cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
 
                 # ================================================================
+                # EXPLORER CONTROLS
+                # "Start Exploring" reproduces the operator's manual sequence
+                # for the robot picked in "Select Robot": build
+                # go2_hardware_autonomy + orchestrator, then
+                # ros2 launch go2_explorer_splitcomp_server_launch.py.
+                #
+                # It returns immediately and drives the host over a restricted
+                # SSH key: a cold colcon build takes minutes, and the launch
+                # then runs until stopped. So the status box + log tail below
+                # track it while the call is in flight, and the detached
+                # launch keeps going if this portal dies.
+                #
+                # It DOES start the Zenoh bridge -- on the host, over that same
+                # SSH connection, before the build (see explorer_control.py).
+                # ================================================================
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### EXPLORER")
+                        gr.Markdown(
+                            "Builds the split-compute explorer and launches it "
+                            "for the robot selected above, starting that robot's "
+                            "Zenoh bridge first. Runs on the server host, so the "
+                            "log below updates as the build progresses."
+                        )
+                        with gr.Row():
+                            explore_start_btn = gr.Button(
+                                "Start Exploring", variant="primary")
+                            explore_stop_btn = gr.Button(
+                                "Stop Exploring", variant="stop")
+                        explore_status = gr.Textbox(
+                            label="Explorer Status", lines=2, interactive=False)
+                    with gr.Column(scale=2):
+                        gr.Markdown("#### EXPLORER LOG (tail)")
+                        explore_log = gr.Textbox(
+                            show_label=False, lines=12, max_lines=12,
+                            interactive=False)
+
+                # ================================================================
                 # BOTTOM ROW: TELEMETRY + STATUS FOOTER
                 # ================================================================
                 with gr.Row():
@@ -1916,6 +1978,67 @@ def main():
                                   outputs=init_status, api_name="drag_initial")
 
                 robot_dd.change(node.set_robot, robot_dd, None)
+
+                # --- Explorer handlers -------------------------------------
+                # Action feedback ("already exploring", "unknown robot", a
+                # refused SIGKILL) has to survive the status tick below: that
+                # tick refreshes the same textbox every 2s, so a message
+                # written straight into it would be overwritten before anyone
+                # could read it. Hold it for a few seconds and let the tick
+                # prepend it while it is still fresh.
+                ACTION_MSG_TTL = 8.0
+                _action_msg = {"text": "", "at": 0.0}
+
+                def _hold(text):
+                    _action_msg["text"] = text
+                    _action_msg["at"] = time.time()
+                    return text
+
+                def _explorer_missing():
+                    return (
+                        f"❌ explorer_control is not available "
+                        f"({EXPLORER_IMPORT_ERROR}). Re-run restore_dashboard.sh "
+                        "to deploy it.",
+                        "",
+                    )
+
+                def on_start_exploring(robot):
+                    if explorer_control is None:
+                        return _explorer_missing()
+                    status, log = explorer_control.start(robot)
+                    return _hold(status), log
+
+                def on_stop_exploring():
+                    if explorer_control is None:
+                        return _explorer_missing()
+                    status, log = explorer_control.stop()
+                    return _hold(status), log
+
+                def on_explorer_tick():
+                    if explorer_control is None:
+                        return _explorer_missing()
+                    status, log = explorer_control.status()
+                    if _action_msg["text"] and \
+                            time.time() - _action_msg["at"] < ACTION_MSG_TTL:
+                        status = f"{_action_msg['text']}\n{status}"
+                    return status, log
+
+                # api_name exposes these as Gradio API endpoints
+                # (POST /gradio_api/call/start_exploring with {"data": ["Luna"]}),
+                # matching the drag_initial endpoint above, so the explorer can
+                # also be driven from a script instead of only by clicking.
+                explore_start_btn.click(
+                    on_start_exploring, inputs=robot_dd,
+                    outputs=[explore_status, explore_log],
+                    api_name="start_exploring")
+                explore_stop_btn.click(
+                    on_stop_exploring, inputs=None,
+                    outputs=[explore_status, explore_log],
+                    api_name="stop_exploring")
+                explore_timer = gr.Timer(2.0)
+                explore_timer.tick(on_explorer_tick,
+                                   outputs=[explore_status, explore_log],
+                                   api_name="explorer_status")
 
             # ================================================================
             # TAB 2: FLEET VIEW (both robots on one map)

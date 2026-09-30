@@ -22,9 +22,14 @@ set -e
 
 SERVER="${SERVER:-salil.kulkarni@10.4.48.11}"
 HOST="${SERVER#*@}"
-CONTAINER="robot_hivemind"
+# The portal container. Deliberately NOT "robot_hivemind": that name is used
+# for a compute container (hardware_code bind-mounted, ROS workspace sourced)
+# and the two must not collide -- sharing a name means whichever was created
+# last silently wins, and the portal then copies its files into a container
+# whose entrypoint is a bare shell and never serves 7860.
+CONTAINER="${CONTAINER:-robot_hivemind_portal}"
 PORT=7860
-FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh"
+FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh explorer_control.py"
 
 echo "============================================================"
 echo " Deploying QOD Lab Go2 map portal -> $SERVER"

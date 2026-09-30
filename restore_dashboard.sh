@@ -21,12 +21,24 @@ set -e
 
 SERVER="${SERVER:-salil.kulkarni@10.4.48.11}"
 HOST="${SERVER#*@}"
-CONTAINER="robot_hivemind"
+# The portal container. Deliberately NOT "robot_hivemind", which is a compute
+# container (see scripts/compute/setup_compute_container.sh). When both used
+# the same name this script's "recreate only if inspect fails" logic silently
+# accepted the wrong container and the portal never came up.
+CONTAINER="${CONTAINER:-robot_hivemind_portal}"
 IMAGE="${IMAGE:-unimelb-humble:dashboard}"   # snapshot: code + deps + boot.sh baked in
 ENTRYPOINT="bash /workspace/boot.sh"
 PORT=7860
-FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh"
+FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh explorer_control.py"
 WEB_BACKEND_FILES="web_backend/qod_consumer.py web_backend/qod_detections.py"
+# Host-side (not container-side) helper that sets up the restricted SSH key the
+# explorer button uses. It is NOT copied into the container -- it runs on the
+# host as the robot owner.
+HOST_SETUP_FILES="scripts/dashboard/install_explorer_key.sh"
+# Deliberately NOT $SERVER. The forced-command key has to be installed into the
+# robot owner's authorized_keys, and explorer_host.sh has to exist in that
+# user's repo, so this runs as the owner regardless of who is deploying.
+EXPLORER_SSH="${EXPLORER_SSH:-selini.samaranayake@10.4.48.11}"
 
 SSH="ssh -o BatchMode=yes $SERVER"
 SCP="scp -o BatchMode=yes"
@@ -39,9 +51,31 @@ echo "============================================================"
 for f in $FILES; do
     [ -f "$f" ] || { echo "ERROR: $f missing. Run from the repo root, or restore it: git checkout 29555bd -- $f"; exit 1; }
 done
+for f in $HOST_SETUP_FILES; do
+    [ -f "$f" ] || { echo "WARNING: $f missing -- the Start Exploring button will not work."; }
+done
 
 # --- 2) Container must exist ------------------------------------------------
 echo "[1/7] Checking container $CONTAINER..."
+# Verify the container is actually the PORTAL and not something that merely
+# borrowed the name. Without this, a container built from a different image
+# passes `docker inspect`, the script copies lab_portal.py into it, restarts it,
+# and then fails much later with a bare "never answered on port 7860" -- which
+# says nothing about the real cause. Check the image, because that is what
+# decides whether boot.sh + the portal deps are even present.
+EXISTING_IMAGE="$($SSH "docker inspect -f '{{.Config.Image}}' $CONTAINER 2>/dev/null" || true)"
+if [ -n "$EXISTING_IMAGE" ] && [ "$EXISTING_IMAGE" != "$IMAGE" ]; then
+    echo "ERROR: container $CONTAINER exists but was built from '$EXISTING_IMAGE',"
+    echo "       not '$IMAGE'. It is not a portal container, so copying files"
+    echo "       into it cannot make it serve port $PORT."
+    echo ""
+    echo "       If this name is taken by a compute container, use a different one:"
+    echo "         CONTAINER=robot_hivemind_portal bash restore_dashboard.sh"
+    echo "       Or remove the stale container first:"
+    echo "         $SSH \"docker rm -f $CONTAINER\""
+    exit 1
+fi
+
 if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
     $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped $IMAGE $ENTRYPOINT"
@@ -138,6 +172,36 @@ echo "[6/7] Starting the portal..."
 # supervisor is the one actually running.
 $SSH "docker restart $CONTAINER" >/dev/null
 echo "  -> Container restarted (runs the boot.sh we just copied in)."
+
+# --- 6b) Explorer button's restricted SSH key --------------------------------
+# The container was just recreated/restarted, so /root/.ssh is empty and the
+# Start Exploring button would be dead without this. Non-fatal on purpose: the
+# dashboard is the thing being restored here, and a missing key costs one
+# button, not the portal. Loud, though -- a silently broken button is worse.
+echo "[6b/7] Installing the explorer button's restricted SSH key (as $EXPLORER_SSH)..."
+if [ -f scripts/dashboard/install_explorer_key.sh ]; then
+    # Deliberately NOT $SCP/$SSH: those already embed $SERVER, so appending
+    # $EXPLORER_SSH yields two destinations and ssh runs the second as a remote
+    # COMMAND (which "succeeds" while doing nothing). Plain ssh/scp here.
+    # Piped through cat rather than scp'd to /tmp because /tmp on this host is
+    # shared between accounts and a file owned by the deploy user is not
+    # overwritable by the robot owner.
+    if KEY_OUT=$(ssh -o BatchMode=yes "$EXPLORER_SSH" \
+                   "cat > \$HOME/install_explorer_key.sh && bash \$HOME/install_explorer_key.sh" \
+                   < scripts/dashboard/install_explorer_key.sh 2>&1); then
+        echo "$KEY_OUT" | sed 's/^/    /'
+        echo "  -> Explorer key installed."
+    else
+        echo "$KEY_OUT" | sed 's/^/    /'
+        echo "  -> WARNING: could not install the explorer key."
+        echo "     The dashboard is UP, but Start Exploring will report a missing key."
+        echo "     Re-run as the robot owner:"
+        echo "       ssh $EXPLORER_SSH 'bash ~/install_explorer_key.sh'"
+    fi
+else
+    echo "  -> SKIPPED: scripts/dashboard/install_explorer_key.sh not found."
+    echo "     Start Exploring will report a missing key until it is installed."
+fi
 
 echo "  -> Waiting for the portal to answer on port $PORT..."
 # --fail matters: without it a Gradio 500 still exits 0 and we would report a
