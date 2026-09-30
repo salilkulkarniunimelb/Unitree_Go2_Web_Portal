@@ -34,6 +34,11 @@ CONTAINER="${CONTAINER:-robot_hivemind}"
 IMAGE="${IMAGE:-unimelb-humble:base}"
 REPO="${REPO:-$HOME/unimelb_project/hardware_code}"
 WS=/workspace/hardware_code/ros2_ws
+# Must match zenoh_ros2dds_server and robot_hivemind_portal. Without it the
+# container lands on the default DDS domain 0 and silently cannot see or be
+# seen by anything on the robot side -- nodes start, look healthy, and exchange
+# no data. Override to match if the fleet is renumbered.
+ROS_DOMAIN="${ROS_DOMAIN:-70}"
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
@@ -63,6 +68,18 @@ if docker inspect "$CONTAINER" >/dev/null 2>&1; then
         if [ "$FORCE" -eq 0 ]; then
             log "$CONTAINER already exists and is idle - nothing to do."
             log "  (mounted: ${MOUNTED:-none})"
+            # A container on the wrong domain is idle, healthy and useless: it
+            # starts nodes that never exchange data with the robot. Worth a
+            # hard error here, since `docker run` cannot fix an existing one.
+            ACTUAL_DOMAIN=$(docker inspect -f \
+                '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" \
+                | sed -n 's/^ROS_DOMAIN_ID=//p' | head -1)
+            if [ "${ACTUAL_DOMAIN:-0}" != "$ROS_DOMAIN" ]; then
+                die "$CONTAINER is on ROS_DOMAIN_ID=${ACTUAL_DOMAIN:-<unset, so 0>} but the fleet uses $ROS_DOMAIN.
+       It cannot see the robot. Recreate it:
+         CONTAINER=$CONTAINER bash setup_compute_container.sh --force"
+            fi
+            log "  (ROS_DOMAIN_ID=$ACTUAL_DOMAIN)"
             exit 0
         fi
         log "--force given: recreating $CONTAINER."
@@ -80,6 +97,8 @@ docker run -d \
     --name "$CONTAINER" \
     --network host \
     --restart unless-stopped \
+    -e ROS_DOMAIN_ID="$ROS_DOMAIN" \
+    -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
     -v "$REPO:/workspace/hardware_code" \
     -w "$WS" \
     "$IMAGE" \
