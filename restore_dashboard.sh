@@ -29,6 +29,11 @@ CONTAINER="${CONTAINER:-robot_hivemind_portal}"
 IMAGE="${IMAGE:-unimelb-humble:dashboard}"   # snapshot: code + deps + boot.sh baked in
 ENTRYPOINT="bash /workspace/boot.sh"
 PORT=7860
+# Must match the explorer container and zenoh_ros2dds_server. Without it the
+# portal lands on the default domain 0, cannot discover ANY robot topic, and
+# silently shows no map, no pose, no plan and no odom while the camera (which
+# is WebRTC, not DDS) keeps working -- so the dashboard looks half-alive.
+ROS_DOMAIN="${ROS_DOMAIN:-70}"
 FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh explorer_control.py"
 WEB_BACKEND_FILES="web_backend/qod_consumer.py web_backend/qod_detections.py"
 # Host-side (not container-side) helper that sets up the restricted SSH key the
@@ -78,7 +83,7 @@ fi
 
 if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
-    $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped $IMAGE $ENTRYPOINT"
+    $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped -e ROS_DOMAIN_ID=$ROS_DOMAIN $IMAGE $ENTRYPOINT"
     echo "  -> Container recreated. It will be restarted at [6/7] to pick up the copied boot.sh."
 else
     if ! $SSH "docker inspect -f '{{.State.Running}}' $CONTAINER" | grep -q true; then
