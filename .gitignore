@@ -4,3 +4,4 @@ __pycache__/
 nohup.out
 .venv/
 *.pid
+.dashboard_fix_backup/

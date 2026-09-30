@@ -42,12 +42,10 @@ done
 
 # --- 2) Container must exist ------------------------------------------------
 echo "[1/7] Checking container $CONTAINER..."
-NEW_CONTAINER=0
 if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
     $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped $IMAGE $ENTRYPOINT"
-    echo "  -> Container recreated. boot.sh auto-starts the portal."
-    NEW_CONTAINER=1
+    echo "  -> Container recreated. It will be restarted at [6/7] to pick up the copied boot.sh."
 else
     if ! $SSH "docker inspect -f '{{.State.Running}}' $CONTAINER" | grep -q true; then
         echo "  -> Container exists but stopped. Starting it..."
@@ -131,13 +129,15 @@ $SSH "docker exec $CONTAINER bash -lc '
 
 # --- 6) Start the portal ------------------------------------------------------
 echo "[6/7] Starting the portal..."
-if [ "$NEW_CONTAINER" = "1" ]; then
-    # A fresh container already has boot.sh auto-starting the portal.
-    echo "  -> New container: boot.sh is starting the portal..."
-else
-    $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh stop || true'"
-    $SSH "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh start'"
-fi
+# ALWAYS restart the container, never rely on the entrypoint having already
+# booted the portal. The dashboard files (boot.sh included) are copied in at
+# step [2/7], which is AFTER the container's entrypoint has run, so on a fresh
+# container PID 1 is still the `sleep infinity` from the boot.sh baked into the
+# IMAGE and the freshly-copied watchdog never takes effect. Restarting makes
+# the container re-exec the /workspace/boot.sh we just deployed, so the
+# supervisor is the one actually running.
+$SSH "docker restart $CONTAINER" >/dev/null
+echo "  -> Container restarted (runs the boot.sh we just copied in)."
 
 echo "  -> Waiting for the portal to answer on port $PORT..."
 # --fail matters: without it a Gradio 500 still exits 0 and we would report a

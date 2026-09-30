@@ -51,7 +51,12 @@ echo "[3/4] Ensuring Python deps present (installs only if missing)..."
 ssh -o BatchMode=yes "$SERVER" "docker exec $CONTAINER bash -lc 'python3 -c \"import gradio,numpy,cv2\" 2>/dev/null || python3 -m pip install --no-cache-dir \"numpy<2\" \"opencv-python-headless<5\" gradio'"
 
 echo "[4/4] Restarting portal in container..."
-ssh -o BatchMode=yes "$SERVER" "docker exec $CONTAINER bash -lc '/workspace/lab_start.sh restart'"
+# Restart the container rather than just the portal process: boot.sh is copied
+# in at [2/4], after the entrypoint already ran, so the running PID 1 is still
+# whatever was baked into the image. Restarting makes the container re-exec the
+# boot.sh we just deployed, so its watchdog is the one actually supervising the
+# portal (otherwise the portal dies and nothing restarts it).
+ssh -o BatchMode=yes "$SERVER" "docker restart $CONTAINER" >/dev/null
 
 echo ""
 echo "DONE. Portal updated and restarted on the server."
