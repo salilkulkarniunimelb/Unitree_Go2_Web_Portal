@@ -3,12 +3,12 @@
 # deploy_lab_portal.sh - One-command deploys of the QOD Lab Go2 map portal.
 #
 # Run this FROM YOUR LAPTOP to push an updated dashboard to the server. It:
-#   1. Copies lab_portal.py (+ controller scripts) into the robot_hivemind
+#   1. Copies lab_portal.py (+ controller scripts) into the robot_hivemind_portal
 #      container
 #   2. Ensures gradio/numpy/opencv are present (no-op once installed)
 #   3. Restarts the portal on port 7860
 #
-# The robot_hivemind container is created by restore_dashboard.sh and
+# The robot_hivemind_portal container is created by restore_dashboard.sh and
 # auto-starts the portal on boot (boot.sh entrypoint), so the dashboard comes
 # back on its own after a server reboot.
 #

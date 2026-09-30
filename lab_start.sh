@@ -1,5 +1,5 @@
 #!/bin/bash
-# lab_start.sh - Run INSIDE the robot_hivemind container.
+# lab_start.sh - Run INSIDE the robot_hivemind_portal container.
 # Start / stop / restart / status for the QOD lab portal (lab_portal.py).
 #
 #   bash lab_start.sh start

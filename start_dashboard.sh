@@ -3,14 +3,16 @@
 # start_dashboard.sh - start/stop the Go2 dashboard from the server, by ANY
 # user (anyone in the docker group, which covers all the lab users).
 #
-# The app + deps live inside the always-running "robot_hivemind" container,
-# so this only controls the portal process. Run it like this (from anywhere):
+# The app + deps live inside the always-running "robot_hivemind_portal"
+# container, so this only controls the portal process. (NOT
+# "robot_hivemind" -- that is the compute container, with hardware_code
+# bind-mounted; it has no portal in it.) Run it like this (from anywhere):
 #
-#   docker exec robot_hivemind /workspace/start_dashboard.sh
-#   docker exec robot_hivemind /workspace/start_dashboard.sh start
-#   docker exec robot_hivemind /workspace/start_dashboard.sh restart
-#   docker exec robot_hivemind /workspace/start_dashboard.sh stop
-#   docker exec robot_hivemind /workspace/start_dashboard.sh status
+#   docker exec robot_hivemind_portal /workspace/start_dashboard.sh
+#   docker exec robot_hivemind_portal /workspace/start_dashboard.sh start
+#   docker exec robot_hivemind_portal /workspace/start_dashboard.sh restart
+#   docker exec robot_hivemind_portal /workspace/start_dashboard.sh stop
+#   docker exec robot_hivemind_portal /workspace/start_dashboard.sh status
 #
 # Then open http://10.4.48.11:7860 in any browser on the network.
 # ---------------------------------------------------------------------------
