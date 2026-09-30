@@ -167,6 +167,7 @@ DETECTIONS_MIN_CONF = float(os.getenv("LAB_DETECTIONS_MIN_CONF", "0.25"))
 DETECTION_CLASS_STYLES = {
     "jerry":  dict(alias="Jerry can",      color=(255, 59, 48)),   # #ff3b30
     "spill":  dict(alias="Chemical spill", color=(34, 197, 94)),   # #22c55e
+    "old_spill": dict(alias="Toxic Sludge", color=(34, 197, 94)),  # #22c55e
     "wire":   dict(alias="Exposed wire",   color=(168, 85, 247)),  # #a855f7
     "rubble": dict(alias="Debris",         color=(59, 130, 246)),  # #3b82f6
 }
@@ -1215,9 +1216,15 @@ class RobotState:
                 if not (0 <= x <= 1.1 and 0 <= y <= 1.1 and
                         0 <= bw <= 1.1 and 0 <= bh <= 1.1):
                     continue
-                style = DETECTION_CLASS_STYLES.get(
-                    cls, DEFAULT_DETECTION_STYLE
-                )
+                style = DETECTION_CLASS_STYLES.get(cls)
+                if style is None:
+                    # Same fallback as the site: an unstyled class keeps its
+                    # raw name (the model also emits classes with no style
+                    # entry, e.g. "old_spill"); only a nameless class becomes
+                    # the generic "Object".
+                    style = dict(DEFAULT_DETECTION_STYLE)
+                    if cls:
+                        style["alias"] = cls
                 label = f"{style['alias']} {conf * 100:.0f}%"
                 px = int(x * w)
                 py = int(y * h)
