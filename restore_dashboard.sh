@@ -186,18 +186,17 @@ echo "  -> Container restarted (runs the boot.sh we just copied in)."
 echo "[6b/7] Installing the explorer button's restricted SSH key (as $EXPLORER_SSH)..."
 
 # 6b-1: deploy the forced-command script itself FIRST.
-# authorized_keys pins command=".../scripts/dashboard/explorer_host.sh", so if
-# that file is absent every Start Exploring press dies with
+# authorized_keys pins command=".../explorer_host.sh", so if that file is absent
+# every Start Exploring press dies with
 #   bash: line 1: .../explorer_host.sh: No such file or directory
-# It lives in the robot owner's repo, where it is UNTRACKED, so a `git clean -fd`
-# by anyone working in that repo silently deletes it and the button stops. The
-# copy in THIS repo is tracked, so re-pipe it over on every restore rather than
-# trusting host state. Must happen before install_explorer_key.sh, which
-# hard-fails if the script is not executable.
+# It goes to $HOME/.config, NOT into hardware_code: that repo is a pull target
+# on this server, so an untracked file in its tree is destroyed by the next
+# `git pull`/`git clean` by anyone working there. Must happen before
+# install_explorer_key.sh, which hard-fails if the script is not executable.
 if [ -f scripts/dashboard/explorer_host.sh ]; then
-    HOST_WRAPPER='$HOME/unimelb_project/hardware_code/scripts/dashboard/explorer_host.sh'
+    HOST_WRAPPER='$HOME/.config/lab-portal-explorer/explorer_host.sh'
     if WRAP_OUT=$(ssh -o BatchMode=yes "$EXPLORER_SSH" \
-                   "mkdir -p \$(dirname $HOST_WRAPPER) && cat > $HOST_WRAPPER && chmod +x $HOST_WRAPPER && echo deployed" \
+                   "mkdir -p \$(dirname $HOST_WRAPPER) && chmod 700 \$(dirname $HOST_WRAPPER) && cat > $HOST_WRAPPER && chmod +x $HOST_WRAPPER && echo deployed" \
                    < scripts/dashboard/explorer_host.sh 2>&1) && \
        echo "$WRAP_OUT" | grep -q deployed; then
         echo "    [host-wrapper] deployed explorer_host.sh -> $HOST_WRAPPER"

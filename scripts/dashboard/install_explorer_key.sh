@@ -26,11 +26,25 @@
 set -o pipefail
 
 USER_SEL="selini.samaranayake"
-REPO="$HOME/unimelb_project/hardware_code"
-HOST_SCRIPT="$REPO/scripts/dashboard/explorer_host.sh"
-KEYDIR="$REPO/.explorer"
+# Everything this button needs lives OUTSIDE any git repository, on purpose.
+# hardware_code on this server is a pull target, not a working copy: nobody
+# edits it here, and `git pull` / `git clean -fd` from the other sessions would
+# wipe (or conflict with) anything we leave in its tree. That is exactly what
+# broke Start Exploring before -- explorer_host.sh and the keypair were
+# untracked files inside the repo and vanished on a clean, taking the button
+# with them while the portal still looked healthy. $HOME/.config survives all
+# of that and is the correct home for host-local state.
+EXPLORER_HOME="${EXPLORER_HOME:-$HOME/.config/lab-portal-explorer}"
+HOST_SCRIPT="$EXPLORER_HOME/explorer_host.sh"
+KEYDIR="$EXPLORER_HOME"
 KEY="$KEYDIR/id_ed25519"
 KNOWN="$KEYDIR/known_hosts"
+# The pre-.config layout, cleaned up on sight. The keypair in particular must
+# not be left lying inside a git working tree, where `git add -A` by anyone
+# could commit it.
+LEGACY_REPO="$HOME/unimelb_project/hardware_code"
+LEGACY_SCRIPT="$LEGACY_REPO/scripts/dashboard/explorer_host.sh"
+LEGACY_KEYDIR="$LEGACY_REPO/.explorer"
 # The PORTAL container (the one running lab_portal.py), not the compute
 # container. Override with CONTAINER=... if the portal is ever renamed.
 CONTAINER="${CONTAINER:-robot_hivemind_portal}"
@@ -123,4 +137,16 @@ status_out="$(docker exec "$CONTAINER" ssh -T -i "$PORTAL_KEY" \
         "$USER_SEL@127.0.0.1" status </dev/null 2>&1 | tail -1)"
 [ -n "$status_out" ] || die "the portal cannot reach the forced command"
 log "portal -> host check: $status_out"
+
+# --- 6. drop the old in-repo copies ----------------------------------------
+# Only reached once the new layout is verified working above, so this cannot
+# strand the button. Best-effort: these are untracked leftovers in a repo we do
+# not own, and failing to delete them must not fail the install.
+if [ -e "$LEGACY_KEYDIR" ] || [ -e "$LEGACY_SCRIPT" ]; then
+    rm -rf "$LEGACY_KEYDIR" 2>/dev/null && log "removed legacy keydir $LEGACY_KEYDIR"
+    rm -f  "$LEGACY_SCRIPT" 2>/dev/null && log "removed legacy $LEGACY_SCRIPT"
+    rmdir "$LEGACY_REPO/scripts/dashboard" 2>/dev/null
+    rmdir "$LEGACY_REPO/scripts" 2>/dev/null
+    log "the explorer keypair no longer lives inside a git working tree"
+fi
 log "done"

@@ -5,7 +5,7 @@
 # This is the forced command behind the dashboard's "Start Exploring" button.
 # The portal (which lives in the robot_hivemind container) opens an SSH
 # connection whose key is pinned in authorized_keys to this exact script via
-#   command="/home/selini.samaranayake/unimelb_project/hardware_code/scripts/dashboard/explorer_host.sh"
+#   command="/home/selini.samaranayake/.config/lab-portal-explorer/explorer_host.sh"
 # so that key can never run anything else, no matter what the portal asks for.
 # sshd passes the client's requested command in $SSH_ORIGINAL_COMMAND.
 #
@@ -30,10 +30,16 @@
 set -o pipefail
 
 CONTAINER=robot_hivemind_luna
-REPO="$HOME/unimelb_project/hardware_code"
+# Host-local state, deliberately outside every git repository. hardware_code
+# here is a pull target: nobody edits it on this server, so writing our log,
+# pidfile and meta into its tree would dirty a repo we do not own and get wiped
+# by the next `git pull`/`git clean`. $HOME/.config is ours alone.
+EXPLORER_HOME="${EXPLORER_HOME:-$HOME/.config/lab-portal-explorer}"
+STATE_DIR="$EXPLORER_HOME"
+# Read-only use of the pulled repo: the zenoh bridge launcher is their script,
+# so run theirs rather than reimplementing the container invocation.
+BRIDGE="$HOME/unimelb_project/hardware_code/scripts/docker/start_zenoh_bridge_container_server.sh"
 WS="/workspace/hardware_code/ros2_ws"
-BRIDGE="$REPO/scripts/docker/start_zenoh_bridge_container_server.sh"
-STATE_DIR="$REPO/.explorer"
 # Written INSIDE the container: the pid of the ros2 launch session leader, so
 # stop can signal the whole node tree rather than just the docker exec client.
 LAUNCH_PIDFILE=/workspace/.explorer_launch.pid

@@ -1,0 +1,34 @@
+--- a/ros2_ws/src/go2_hardware_autonomy/go2_hardware_autonomy/occupancy_grid_relay.py
++++ b/ros2_ws/src/go2_hardware_autonomy/go2_hardware_autonomy/occupancy_grid_relay.py
+@@ -22,17 +22,28 @@
+             self.get_parameter("republish_period").value
+         )
+         self.last_map = None
+-        qos = QoSProfile(
++        # Two profiles on purpose, do not merge back into one. The output is
++        # latched so a late-joining consumer (the web portal) still gets the
++        # current map. The input must be VOLATILE: upstream SLAM publishes /map
++        # as VOLATILE, and a TRANSIENT_LOCAL subscriber is incompatible with a
++        # VOLATILE publisher, so a latched input silently receives nothing.
++        out_qos = QoSProfile(
+             reliability=ReliabilityPolicy.RELIABLE,
+             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+             history=HistoryPolicy.KEEP_LAST,
+             depth=1,
+         )
++        in_qos = QoSProfile(
++            reliability=ReliabilityPolicy.RELIABLE,
++            durability=DurabilityPolicy.VOLATILE,
++            history=HistoryPolicy.KEEP_LAST,
++            depth=1,
++        )
+         input_topic = str(self.get_parameter("input_topic").value)
+         output_topic = str(self.get_parameter("output_topic").value)
+-        self.publisher = self.create_publisher(OccupancyGrid, output_topic, qos)
++        self.publisher = self.create_publisher(OccupancyGrid, output_topic, out_qos)
+         self.subscription = self.create_subscription(
+-            OccupancyGrid, input_topic, self.map_callback, qos
++            OccupancyGrid, input_topic, self.map_callback, in_qos
+         )
+         self.timer = None
+         if self.republish_period > 0.0:
