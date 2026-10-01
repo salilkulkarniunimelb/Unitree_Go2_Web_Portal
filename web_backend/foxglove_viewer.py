@@ -24,8 +24,9 @@ What it renders, and why it is not just a point-cloud dump:
 The lidar publishes in its own frame (<robot>/utlidar_lidar), so a raw feed
 swims around with the robot and is useless as a map. Foxglove does not do that,
 and neither do we: every incoming cloud is transformed into the map frame on
-arrival and appended to a persistent buffer. That is what makes the world
-appear still while the robot drives through it.
+arrival and kept for a short rolling window (see FOXGLOVE_WINDOW_SECS). That is
+what makes the world appear still while the robot drives through it, without the
+register slip a long accumulation suffers as SLAM's correction drifts.
 
 Frames:
   ROS is Z-up, three.js is Y-up, so a map-frame ROS point (x, y, z) is displayed
@@ -43,13 +44,16 @@ Usage:
     python3 -m web_backend.foxglove_viewer
 Environment:
     FOXGLOVE_PORT         port to serve on                   (default 8767)
-    FOXGLOVE_MAX_POINTS   points per streamed frame          (default 12000)
+    FOXGLOVE_MAX_POINTS   points per streamed frame          (default 150000)
     FOXGLOVE_FPS          streamed frames per second         (default 10)
-    FOXGLOVE_ACCUM_MAX    points held in the map-frame buffer (default 400000)
+    FOXGLOVE_WINDOW_SECS  seconds of scans kept in the buffer (default 2.0)
+    FOXGLOVE_ACCUM_MAX    hard point cap for the buffer       (default 2000000)
+    FOXGLOVE_CLOUD_TOPIC  point-cloud topic to view           (default /go2/accumulated/cloud_base)
 """
 
 import asyncio
 import base64
+from collections import deque
 import json
 import math
 import os
@@ -72,10 +76,24 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 PORT = _env_int("FOXGLOVE_PORT", 8767)
-MAX_POINTS_PER_FRAME = _env_int("FOXGLOVE_MAX_POINTS", 12000)
+MAX_POINTS_PER_FRAME = _env_int("FOXGLOVE_MAX_POINTS", 150000)
 TARGET_FPS = float(_env_int("FOXGLOVE_FPS", 10))
-ACCUM_MAX_POINTS = _env_int("FOXGLOVE_ACCUM_MAX", 400_000)
+# Rolling window over which scans are kept in the map frame. Foxglove shows a
+# live cloud, so only recent scans may be drawn: each scan is frozen into map
+# coordinates as it arrives, and SLAM's map<-odom correction keeps drifting, so
+# a long accumulation slowly slides out of register with the current grid.
+WINDOW_SECS = _env_float("FOXGLOVE_WINDOW_SECS", 2.0)
+# Hard memory guard for the rolling buffer; only reached if the window is set
+# extremely large.
+ACCUM_MAX_POINTS = _env_int("FOXGLOVE_ACCUM_MAX", 2_000_000)
 
 # Shared by the page, the portal iframe and the handshake interceptor below, so
 # the socket path exists in exactly one place.
@@ -85,11 +103,33 @@ ROBOT_NAMESPACES = ("luna", "astro")
 ROBOT_LABELS = {"luna": "Luna", "astro": "Astro"}
 
 LIDAR_TOPIC = "/{ns}/go2/restamped/cloud_base"
+# Optional cloud-topic override. Defaults to the motion-compensated scan
+# accumulator output ("/go2/accumulated/cloud_base", already in base_link) so
+# the map view can be trialled against it. Set FOXGLOVE_CLOUD_TOPIC to
+# "/{ns}/go2/restamped/cloud_base" (or any other topic) to switch, and to ""
+# to fall back to the raw restamped cloud. A value without a "{ns}" placeholder
+# is used verbatim for every robot.
+CLOUD_TOPIC = os.environ.get(
+    "FOXGLOVE_CLOUD_TOPIC", "/go2/accumulated/cloud_base"
+).strip() or LIDAR_TOPIC
+
+
+def cloud_topic(ns):
+    return CLOUD_TOPIC.format(ns=ns)
+
+
 MAP_TOPIC = "/{ns}/lidar_slam_2d_map"
 AMCL_TOPIC = "/{ns}/amcl_pose"
 ODOM_TOPIC = "/{ns}/go2/restamped/robot_odom"
 TF_STATIC_TOPIC = "/{ns}/tf_static"
 PLAN_TOPIC = "/{ns}/plan"
+# SLAM's map <- odom correction (TransformStamped, frame_id="map",
+# child_frame_id="<ns>/odom"). The lidar SLAM stack publishes this so
+# consumers can lift the drift-prone odom frame into the map frame that the
+# occupancy grid and the real Foxglove app both use. Without it the viewer
+# drew odom as if it were map, which offset the cloud and the robot body from
+# the occupancy grid by a fixed translation + yaw.
+MAP_ODOM_CORRECTION_TOPIC = "/{ns}/go2/split_compute/map_odom_correction"
 
 MSG_CLOUD = 1
 MSG_PATH = 2
@@ -268,110 +308,78 @@ def decode_point_cloud(msg):
 # Map-frame accumulation
 # ===========================================================================
 class MapFrameBuffer:
-    """Lidar frames accumulated in the map frame, bounded in memory but not in
-    extent.
+    """Lidar frames held in the map frame over a short rolling time window.
 
-    A ring buffer would be wrong here. Ingest is ~12k points/second, so a
-    400k-point cap would roll over in well under a minute and the view would
-    trail the robot like a 30-second window instead of being a map. Instead,
-    when the buffer fills it is compacted by keeping every other point and the
-    ingestion stride is doubled, so a new frame contributes every 2nd point,
-    then every 4th, and so on.
+    Each incoming frame is stored with a wall-clock stamp and frames older than
+    ``window_secs`` are dropped. This mirrors how the Foxglove app renders a
+    live point cloud: only recent scans are shown, so the cloud always tracks
+    the current occupancy grid.
 
-    The result is the same behaviour as voxel-map decimation: memory stays
-    fixed, the covered area only ever grows, and old regions get sparser rather
-    than disappearing. The visible thinning is the honest trade for unbounded
-    extent.
+    Why not a persistent, ever-growing map: every scan is frozen into map
+    coordinates at the moment it arrives, using SLAM's map<-odom correction as
+    it stands then. That correction keeps moving as odom drifts and the graph is
+    optimised, so points captured minutes ago slowly slide out of register with
+    the current grid -- the cloud drifts even though the robot marker, which is
+    drawn with the live pose, stays put. A rolling window sidesteps the whole
+    problem and matches Foxglove's behaviour.
+
+    ``capacity`` is only a hard memory guard for pathological windows.
     """
 
-    def __init__(self, capacity):
+    def __init__(self, window_secs, capacity):
+        self.window_secs = max(0.1, float(window_secs))
         self.capacity = max(1000, int(capacity))
-        self._xyz = np.zeros((self.capacity, 3), dtype=np.float32)
-        self._rgb = np.zeros((self.capacity, 3), dtype=np.uint8)
+        self._frames = deque()      # (stamp, xyz, rgb)
         self._n = 0
-        self._stride = 1        # keep 1 in every _stride incoming points
-        self._phase = 0         # rolling offset so the stride does not align
-        self.compactions = 0
+        self.dropped_frames = 0
 
     def __len__(self):
         return self._n
 
+    # Retained for the /health shape. A rolling window never decimates or
+    # compacts the way the old unbounded buffer did.
     @property
     def stride(self):
-        return self._stride
+        return 1
 
-    def _compact(self):
-        """Halve the stored resolution, doubling the ingestion stride to match.
+    @property
+    def compactions(self):
+        return 0
 
-        Compaction is what makes the extent unbounded: each pass covers twice
-        the ground for the same memory, so the map keeps growing and old areas
-        thin out instead of being dropped.
-        """
-        if self._n < 2:
-            # Nothing worth halving. Do not double the stride either -- that
-            # would halve the ingest rate on an empty buffer for nothing.
-            self._n = 0
-            return
-        keep = self._n // 2
-        self._xyz[:keep] = self._xyz[: 2 * keep : 2]
-        self._rgb[:keep] = self._rgb[: 2 * keep : 2]
-        self._n = keep
-        self._stride *= 2
-        self.compactions += 1
+    @property
+    def span_secs(self):
+        if len(self._frames) < 2:
+            return 0.0
+        return self._frames[-1][0] - self._frames[0][0]
+
+    def _evict(self):
+        cutoff = time.time() - self.window_secs
+        while self._frames and self._frames[0][0] < cutoff:
+            self._n -= len(self._frames.popleft()[1])
+            self.dropped_frames += 1
+        while self._n > self.capacity and len(self._frames) > 1:
+            self._n -= len(self._frames.popleft()[1])
+            self.dropped_frames += 1
 
     def extend(self, xyz, rgb):
         n = int(xyz.shape[0])
         if n == 0:
             return
-
-        # Global decimation: keep 1 in every _stride incoming points. The phase
-        # is carried across frames so a frame boundary cannot resurrect points
-        # the stride has already skipped.
-        if self._stride > 1:
-            start = (-self._phase) % self._stride
-            xyz = xyz[start:: self._stride]
-            rgb = rgb[start:: self._stride]
-            self._phase = (self._phase + n) % self._stride
-            n = int(xyz.shape[0])
-            if n == 0:
-                return
-
-        room = self.capacity - self._n
-        if n > room:
-            self._compact()
-            room = self.capacity - self._n
-        if n > room:
-            # Still oversized -- a single frame bigger than the whole budget.
-            # Stride-sample just this frame rather than dropping it.
-            step = int(math.ceil(n / max(1, room)))
-            xyz = xyz[::step]
-            rgb = rgb[::step]
-            n = int(xyz.shape[0])
-            if n == 0:
-                return
-
-        end = self._n + n
-        self._xyz[self._n: end] = xyz
-        self._rgb[self._n: end] = rgb
-        self._n = end
+        self._frames.append((time.time(), xyz, rgb))
+        self._n += n
+        self._evict()
 
     def sample(self, budget):
-        """Stride-sample the buffer down to ~budget points for streaming.
-
-        The stored buffer is already uniformly sparse in time, so an even stride
-        over it thins the whole map evenly instead of dropping the far end.
-        """
-        total = self._n
-        if total == 0:
+        """Concatenate the live window and stride it down to ~budget points."""
+        if self._n == 0:
             return None, None
-        # Slice the live region first: striding the whole capacity-sized array
-        # would hand back rows that were never written.
-        live_xyz = self._xyz[:total]
-        live_rgb = self._rgb[:total]
+        xyz = np.concatenate([f[1] for f in self._frames], axis=0)
+        rgb = np.concatenate([f[2] for f in self._frames], axis=0)
+        total = xyz.shape[0]
         if total <= budget:
-            return live_xyz, live_rgb
+            return xyz, rgb
         step = int(math.ceil(total / budget))
-        return live_xyz[::step], live_rgb[::step]
+        return xyz[::step], rgb[::step]
 
 
 # ===========================================================================
@@ -382,7 +390,7 @@ class RobotState:
         self.ns = ns
         self.label = ROBOT_LABELS[ns]
 
-        self.buffer = MapFrameBuffer(ACCUM_MAX_POINTS)
+        self.buffer = MapFrameBuffer(WINDOW_SECS, ACCUM_MAX_POINTS)
         self.map_png = None
         self.map_meta = None
         self.map_seq = 0
@@ -393,6 +401,12 @@ class RobotState:
         self.pose_stamp = 0.0
         self.odom_pose = None       # odom frame
         self.odom_stamp = 0.0
+        # map <- odom from SLAM (/…/split_compute/map_odom_correction). This is
+        # the transform that lifts odom-frame data into the map frame the
+        # occupancy grid lives in; composed with the odom pose it yields a live
+        # map-frame pose even while AMCL is silent.
+        self.map_from_odom = None
+        self.map_from_odom_stamp = 0.0
         # Odom reading captured at the moment the last AMCL fix arrived. Odom is
         # 10x faster but drifts; anchoring it to that instant is what lets the
         # robot move smoothly between (slow) AMCL updates without ever leaving
@@ -413,7 +427,7 @@ class RobotState:
         self._subscribe(node)
 
     def _subscribe(self, node):
-        from geometry_msgs.msg import PoseWithCovarianceStamped
+        from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
         from nav_msgs.msg import OccupancyGrid, Odometry, Path
         from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import PointCloud2
@@ -439,7 +453,7 @@ class RobotState:
         # matches.
         default_qos = QoSProfile(depth=10)
 
-        node.create_subscription(PointCloud2, LIDAR_TOPIC.format(ns=self.ns),
+        node.create_subscription(PointCloud2, cloud_topic(self.ns),
                                  self._on_cloud, sensor_qos)
         node.create_subscription(OccupancyGrid, MAP_TOPIC.format(ns=self.ns),
                                  self._on_map, map_qos)
@@ -463,6 +477,15 @@ class RobotState:
                                  self._on_tf_static, map_qos)
         node.create_subscription(TFMessage, TF_STATIC_TOPIC.format(ns=self.ns),
                                  self._on_tf_static, sensor_qos)
+        # SLAM's map<-odom correction. Published latched RELIABLE/TRANSIENT_LOCAL
+        # by the lidar SLAM stack, so the same dual-subscription pattern as
+        # tf_static covers both a latched publisher and a best-effort relay.
+        node.create_subscription(TransformStamped,
+                                 MAP_ODOM_CORRECTION_TOPIC.format(ns=self.ns),
+                                 self._on_map_odom, map_qos)
+        node.create_subscription(TransformStamped,
+                                 MAP_ODOM_CORRECTION_TOPIC.format(ns=self.ns),
+                                 self._on_map_odom, sensor_qos)
 
     # ------------------------------------------------------------ callbacks
     def _on_cloud(self, msg):
@@ -513,20 +536,19 @@ class RobotState:
             gray = (disp * 255).astype(np.uint8)
             img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-            # 512 px keeps a big occupancy grid cheap to ship as PNG while
-            # still reading clearly underneath the point cloud.
-            canvas = 512
-            scale = canvas / max(info.height, info.width)
+            # Downscale for transport but keep the grid's own aspect ratio. The
+            # browser sizes the floor plane from width*resolution x
+            # height*resolution, so padding the image to a square canvas would
+            # stretch the map off the point cloud along whichever axis is
+            # shorter (and drag the robot body off its own scans with it).
+            max_px = 512
+            scale = max_px / max(info.height, info.width)
             img = cv2.resize(img,
                              (max(1, int(info.width * scale)),
                               max(1, int(info.height * scale))),
                              interpolation=cv2.INTER_NEAREST)
-            out = np.full((canvas, canvas, 3), 255, dtype=np.uint8)
-            ox = (canvas - img.shape[1]) // 2
-            oy = (canvas - img.shape[0]) // 2
-            out[oy:oy + img.shape[0], ox:ox + img.shape[1]] = img
 
-            ok, buf = cv2.imencode(".png", out)
+            ok, buf = cv2.imencode(".png", img)
             if not ok:
                 return
             self.map_png = base64.b64encode(buf.tobytes()).decode("ascii")
@@ -594,18 +616,51 @@ class RobotState:
         except Exception as exc:  # noqa: BLE001
             self.last_error = repr(exc)
 
+    def _on_map_odom(self, msg):
+        """SLAM's map <- odom correction (geometry_msgs/TransformStamped)."""
+        try:
+            tr = msg.transform.translation
+            q = msg.transform.rotation
+            self.map_from_odom = quaternion_matrix(
+                q.x, q.y, q.z, q.w, tr.x, tr.y, tr.z)
+            self.map_from_odom_stamp = time.time()
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = repr(exc)
+
     # ----------------------------------------------------------- transforms
+    def _odom_in_map(self, odom):
+        """Lift an odom-frame pose into the map frame using SLAM's correction.
+
+        Returns a map-frame pose dict, or the raw odom pose when the correction
+        is missing (or odom has gone stale). This is what lines the cloud and
+        the robot body up with the occupancy grid, which lives in 'map'.
+        """
+        if odom is None:
+            return None
+        fresh = (time.time() - self.odom_stamp) <= ODOM_MAX_AGE
+        if self.map_from_odom is None or not fresh:
+            return odom
+        m = self.map_from_odom @ pose_matrix(
+            odom["x"], odom["y"], odom["yaw"], odom.get("z", 0.0))
+        return {
+            "x": float(m[0, 3]),
+            "y": float(m[1, 3]),
+            "z": float(m[2, 3]),
+            "yaw": math.atan2(float(m[1, 0]), float(m[0, 0])),
+        }
+
     def map_pose(self):
         """Map-frame (x, y, yaw), or None.
 
-        AMCL is the accurate, low-rate source. Odom is 10x faster but drifts in
-        its own frame, so between AMCL fixes it is carried forward from the
-        reading captured at the last fix. That is what stops the robot marker
-        stuttering at AMCL's update rate.
+        Order of preference:
+          1. AMCL, carried forward with the odom delta captured at its last fix
+             (accurate, and smooth between its slow updates).
+          2. Odom lifted into the map frame by SLAM's map<-odom correction.
+          3. Raw odom (unreliable frame, last resort before any map data).
         """
         amcl, odom = self.pose, self.odom_pose
         if amcl is None:
-            return odom
+            return self._odom_in_map(odom)
         odom_fresh = (odom is not None
                       and (time.time() - self.odom_stamp) <= ODOM_MAX_AGE
                       and self.odom_anchor is not None)
@@ -654,17 +709,20 @@ class RobotState:
         return {
             "cloud_msgs": self.cloud_msgs,
             "buffered": len(self.buffer),
-            # Exposed because a rising stride means the buffer is decimating:
-            # old ground is thinning rather than being dropped, and the view
-            # still covers the whole run.
-            "buffer_stride": self.buffer.stride,
-            "compactions": self.buffer.compactions,
+            # Rolling window: the cloud shows only scans from the last
+            # `window_secs`, so it stays registered to the live occupancy grid.
+            "window_secs": round(self.buffer.window_secs, 2),
+            "window_span_secs": round(self.buffer.span_secs, 2),
             "dropped_no_pose": self.dropped_no_pose,
             "last_cloud_age": None if not self.last_cloud_wall
                               else round(time.time() - self.last_cloud_wall, 2),
             "has_pose": self.map_pose() is not None,
             "pose_source": ("amcl" if self.pose is not None
-                            else ("odom" if self.odom_pose is not None else None)),
+                            else ("map_odom"
+                                  if (self.map_from_odom is not None
+                                      and self.odom_pose is not None)
+                                  else ("odom" if self.odom_pose is not None
+                                        else None))),
             "has_map": self.map_png is not None,
             "plan_points": len(self.plan),
             "last_error": self.last_error,
@@ -710,7 +768,7 @@ class Bridge:
         for ns in ROBOT_NAMESPACES:
             try:
                 self.robots[ns] = RobotState(ns, node)
-                _log(f"[{ns}] subscribed to {LIDAR_TOPIC.format(ns=ns)}")
+                _log(f"[{ns}] subscribed to {cloud_topic(ns)}")
             except Exception as exc:  # noqa: BLE001
                 _log(f"[{ns}] subscription setup failed: {exc!r}")
         self._node = node
@@ -951,7 +1009,7 @@ async def client_handler(ws, bridge):
                     if stats["dropped_no_pose"]:
                         note = "waiting for robot pose (amcl/odom) before cloud can be placed..."
                     elif announced != "cloud":
-                        note = f"waiting for {LIDAR_TOPIC.format(ns=ns)} ..."
+                        note = f"waiting for {cloud_topic(ns)} ..."
                     else:
                         note = None
                     if note:
@@ -968,6 +1026,8 @@ async def client_handler(ws, bridge):
     try:
         await ws.send(json.dumps({"type": "status",
                                   "message": "connected"}))
+        await ws.send(json.dumps({"type": "topic",
+                                  "topic": cloud_topic(ns)}))
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -979,6 +1039,8 @@ async def client_handler(ws, bridge):
             if wanted in ROBOT_NAMESPACES:
                 ns = wanted
                 _log(f"client subscribed to {ns}")
+                await ws.send(json.dumps({"type": "topic",
+                                          "topic": cloud_topic(ns)}))
             elif wanted:
                 await ws.send(json.dumps({
                     "type": "error",

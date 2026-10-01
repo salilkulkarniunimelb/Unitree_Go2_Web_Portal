@@ -80,7 +80,7 @@
 
   <div id="hud">
     <div><b>Robot</b> <span class="val" id="hud-robot">Luna</span> &nbsp;|&nbsp; <b>Frame</b> <span class="val">map</span></div>
-    <div><b>Topic</b> <span class="val" id="hud-topic">/luna/go2/restamped/cloud_base</span></div>
+    <div><b>Topic</b> <span class="val" id="hud-topic">(resolving&hellip;)</span></div>
     <div><b>Points</b> <span class="val" id="hud-points">0</span> &nbsp;|&nbsp; <b>Render</b> <span class="val" id="hud-fps">0 fps</span> &nbsp;|&nbsp; <b>Stream</b> <span class="val" id="hud-stream">0 fps</span></div>
     <div><b>Robot pose</b> <span class="val" id="hud-pose">x &ndash; y &ndash; yaw &ndash;</span></div>
     <div><b>Status</b> <span id="status-waiting">connecting&hellip;</span></div>
@@ -275,7 +275,7 @@
       wantedRobot = params.get('robot') || 'Luna';
       const ns = wantedRobot.toLowerCase();
       hud.robot.textContent = wantedRobot;
-      hud.topic.textContent = '/${ns}/go2/restamped/cloud_base'.replace('${ns}', ns);
+      hud.topic.textContent = '(resolving…)';   // backend sends the live topic
 
       const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
       // Same origin: the viewer page and the socket are served by the same
@@ -301,6 +301,7 @@
             const msg = JSON.parse(evt.data);
             if (msg.type === 'map' && msg.png) applyFloorTexture(msg);
             else if (msg.type === 'error') { setStatus('error', msg.message); setError(msg.detail || ''); }
+            else if (msg.type === 'topic') hud.topic.textContent = msg.topic;
             else if (msg.type === 'status') setStatus('waiting', msg.message);
             else if (msg.type === 'robots') setStatus('waiting', 'waiting for point cloud…');
           } catch (e) { console.warn('bad control message', e); }
