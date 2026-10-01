@@ -10,10 +10,11 @@
 # bare `bash`, restarted it, and then reported "the portal never answered on
 # port 7860" with nothing pointing at the real cause.
 #
-#   robot_hivemind        compute  (this script)   hardware_code bind-mounted
+#   robot_hivemind        compute  (this script)   hardware_code bind-mounted;
++#                                                also where the explorer builds
+#                                                and launches (see
+#                                                scripts/dashboard/explorer_host.sh)
 #   robot_hivemind_portal dashboard                serves 7860
-#   robot_hivemind_luna   compute                 the container the explorer
-#                                                 builds and launches in
 #
 # What "smoothly" means here, versus the ad-hoc container this replaces:
 #   * Restart=unless-stopped, so it comes back after a reboot instead of

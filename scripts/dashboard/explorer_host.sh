@@ -9,11 +9,22 @@
 # so that key can never run anything else, no matter what the portal asks for.
 # sshd passes the client's requested command in $SSH_ORIGINAL_COMMAND.
 #
-# The explorer cannot run in the portal's own container: robot_hivemind has no
-# volume mounts and the unimelb-humble:dashboard image ships no ros2_ws/src at
-# all. The code lives on this host, bind-mounted into robot_hivemind_luna,
-# which is where the build and the launch actually happen. That container is
-# the one with ROS humble, the 11 workspace packages and ROS_DOMAIN_ID=70.
+# The explorer cannot run in the portal's own container: robot_hivemind_portal
+# has no volume mounts and the unimelb-humble:dashboard image ships no
+# ros2_ws/src at all. The code lives on this host, bind-mounted into
+# robot_hivemind, which is where the build and the launch actually happen. That
+# container is the one with ROS humble, the 11 workspace packages and
+# ROS_DOMAIN_ID=70.
+#
+# robot_hivemind is shared with hand-run compute (colcon build, ros2 run), which
+# is the point: it already holds the workspace this needs, so a separate
+# robot_hivemind_luna only added a second container to keep in sync -- and a
+# name to drift out of date with. Both roles are safe in one container because
+# the portal keeps its own container (so `docker restart` on a dashboard deploy
+# still cannot disturb a live launch) and because
+# scripts/compute/setup_compute_container.sh refuses to recreate this container
+# while anything beyond its idle shell is running, which is exactly the
+# protection a live launch needs.
 #
 # Accepted $SSH_ORIGINAL_COMMAND values (anything else is refused):
 #   start <luna|astro>   zenoh bridge -> ensure container -> build -> launch
@@ -29,7 +40,7 @@
 # ---------------------------------------------------------------------------
 set -o pipefail
 
-CONTAINER=robot_hivemind_luna
+CONTAINER=robot_hivemind
 # Host-local state, deliberately outside every git repository. hardware_code
 # here is a pull target: nobody edits it on this server, so writing our log,
 # pidfile and meta into its tree would dirty a repo we do not own and get wiped

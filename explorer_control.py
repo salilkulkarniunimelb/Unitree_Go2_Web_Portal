@@ -1,17 +1,17 @@
 """Dashboard-side controller for the split-compute explorer.
 
-The dashboard (lab_portal.py) runs INSIDE the robot_hivemind container, which
-cannot start the explorer itself: that container has no volume mounts, no
+The dashboard (lab_portal.py) runs INSIDE the robot_hivemind_portal container,
+which cannot start the explorer itself: that container has no volume mounts, no
 docker socket, and the unimelb-humble:dashboard image ships no ros2_ws/src at
 all. The code and the build toolchain live on the server host, bind-mounted
-into the robot_hivemind_luna container, and that is where a launch has to
+into the robot_hivemind compute container, and that is where a launch has to
 happen.
 
 So this module does not build or launch anything itself. It drives the host
 over a deliberately restricted SSH connection:
 
-    portal (robot_hivemind)  --ssh-->  host  --docker exec-->  robot_hivemind_luna
-      explorer_control.py                explorer_host.sh          colcon / ros2 launch
+    portal (robot_hivemind_portal) --ssh--> host --docker exec--> robot_hivemind
+      explorer_control.py                 explorer_host.sh        colcon / ros2 launch
 
 The key used for that connection is pinned in the host's authorized_keys with
 `restrict` and `command=.../explorer_host.sh`, so it can only ever run that one

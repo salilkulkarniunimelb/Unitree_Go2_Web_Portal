@@ -31,7 +31,7 @@ fleet panel: it starts that robot's Zenoh bridge, builds go2_hardware_autonomy
 container cannot do any of that itself -- it has no volume mounts and no ROS
 workspace -- so explorer_control.py drives the server host over a restricted
 SSH key that is pinned to one forced-command script, and the build and launch
-happen in the robot_hivemind_luna container. The launch is detached once
+happen in the robot_hivemind compute container. The launch is detached once
 started, so exploration survives the browser closing or the portal restarting.
 
 Working features stream live (map, camera, battery, pose). Features not yet
