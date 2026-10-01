@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Foxglove-style 3D View</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #101014;
+      color: #e6e6e6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(12, 12, 16, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.7;
+      min-width: 300px;
+      pointer-events: none;
+    }
+    #hud b { color: #8ab4f8; font-weight: 600; }
+    #hud .val { color: #fff; }
+    #status-streaming { color: #81c995; }
+    #status-waiting { color: #f6c177; }
+    #status-error { color: #ff8a80; }
+    #status-offline { color: #9aa0a6; }
+    #help {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(12, 12, 16, 0.7);
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 11px;
+      color: #b0b0b8;
+      pointer-events: none;
+    }
+    #loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 20;
+      background: #101014;
+      font-size: 14px;
+      color: #8ab4f8;
+    }
+    #err-detail {
+      position: absolute;
+      bottom: 46px;
+      left: 10px;
+      right: 10px;
+      z-index: 10;
+      display: none;
+      background: rgba(60, 12, 12, 0.85);
+      border: 1px solid rgba(255, 138, 128, 0.35);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: #ffcdb2;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading 3D engine&hellip;</div>
+
+  <div id="hud">
+    <div><b>Robot</b> <span class="val" id="hud-robot">Luna</span> &nbsp;|&nbsp; <b>Frame</b> <span class="val">map</span></div>
+    <div><b>Topic</b> <span class="val" id="hud-topic">/luna/go2/restamped/cloud_base</span></div>
+    <div><b>Points</b> <span class="val" id="hud-points">0</span> &nbsp;|&nbsp; <b>Render</b> <span class="val" id="hud-fps">0 fps</span> &nbsp;|&nbsp; <b>Stream</b> <span class="val" id="hud-stream">0 fps</span></div>
+    <div><b>Robot pose</b> <span class="val" id="hud-pose">x &ndash; y &ndash; yaw &ndash;</span></div>
+    <div><b>Status</b> <span id="status-waiting">connecting&hellip;</span></div>
+  </div>
+
+  <div id="err-detail"></div>
+  <div id="help">
+    Left-drag orbit &nbsp;·&nbsp; Right-drag pan &nbsp;·&nbsp; Wheel zoom &nbsp;·&nbsp;
+    <b>F</b> frame robot &nbsp;·&nbsp; <b>T</b> top view &nbsp;·&nbsp; <b>G</b> toggle grid
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three/three.module.js",
+      "three/addons/controls/OrbitControls.js": "./vendor/three/OrbitControls.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ------------------------------------------------------------------ HUD
+    const $ = (id) => document.getElementById(id);
+    const hud = {
+      robot: $('hud-robot'), topic: $('hud-topic'), points: $('hud-points'),
+      fps: $('hud-fps'), stream: $('hud-stream'), pose: $('hud-pose'),
+      status: $('status-waiting'), err: $('err-detail'), loading: $('loading'),
+    };
+    function setStatus(kind, text) {
+      hud.status.className = '';
+      hud.status.id = 'status-' + kind;
+      hud.status.textContent = text;
+    }
+    function setError(text) {
+      if (!text) { hud.err.style.display = 'none'; return; }
+      hud.err.textContent = text;
+      hud.err.style.display = 'block';
+    }
+
+    // --------------------------------------------------------------- scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101014);
+    scene.fog = new THREE.Fog(0x101014, 25, 90);
+
+    const camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.05, 500);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = true;   // right-drag pans in screen space, like Foxglove
+    controls.minDistance = 0.3;
+    controls.maxDistance = 120;
+
+    // Lights: PointsMaterial is unlit, but the robot body and grid look better lit.
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(5, 12, 7);
+    scene.add(dir);
+
+    // Axes: X red (map east), Y green (map up), Z blue. ROS/REP-103 convention
+    // in three.js is Y-up, so we keep Y as "map up" exactly like Foxglove.
+    const axes = new THREE.AxesHelper(1.5);
+    scene.add(axes);
+
+    const grid = new THREE.GridHelper(40, 40, 0x55555f, 0x2b2b33);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.55;
+    scene.add(grid);
+
+    // --------------------------------------------------------- point cloud
+    const MAX_POINTS = 400000;           // client-side hard cap
+    const positions = new Float32Array(MAX_POINTS * 3);
+    const colors = new Float32Array(MAX_POINTS * 3);
+    let pointCount = 0;
+
+    const cloudGeom = new THREE.BufferGeometry();
+    cloudGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    cloudGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    cloudGeom.setDrawRange(0, 0);
+
+    const cloudMat = new THREE.PointsMaterial({
+      size: 0.035,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+    });
+    const cloud = new THREE.Points(cloudGeom, cloudMat);
+    cloud.frustumCulled = false;
+    scene.add(cloud);
+
+    // ------------------------------------------------------- ground plane
+    // The 2D occupancy grid, drawn as a textured plane at z = 0 so the 3D
+    // point cloud has a floor to sit on.
+    const floorMat = new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), floorMat);
+    floor.rotation.x = -Math.PI / 2;     // plane XY -> XZ
+    floor.visible = false;
+    scene.add(floor);
+
+    // --------------------------------------------------------- robot body
+    const robotGroup = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.62, 0.28, 0.24),
+      new THREE.MeshLambertMaterial({ color: 0xe8453c })
+    );
+    body.position.y = 0.22;
+    robotGroup.add(body);
+
+    const head = new THREE.Mesh(
+      new THREE.SphereGeometry(0.07, 16, 12),
+      new THREE.MeshLambertMaterial({ color: 0xffffff })
+    );
+    head.position.set(0.28, 0.28, 0);
+    robotGroup.add(head);
+
+    const lidar = new THREE.Mesh(
+      new THREE.BoxGeometry(0.16, 0.08, 0.16),
+      new THREE.MeshLambertMaterial({ color: 0x4d9de0 })
+    );
+    lidar.position.set(-0.05, 0.40, 0);
+    robotGroup.add(lidar);
+
+    // Forward arrow, so heading is readable at a glance.
+    const arrow = new THREE.Mesh(
+      new THREE.ConeGeometry(0.07, 0.26, 12),
+      new THREE.MeshLambertMaterial({ color: 0xffd166 })
+    );
+    arrow.rotation.z = -Math.PI / 2;     // point along +X
+    arrow.position.set(0.44, 0.22, 0);
+    robotGroup.add(arrow);
+
+    scene.add(robotGroup);
+
+    // --------------------------------------------------------- nav2 path
+    const PATH_MAX = 4000;
+    const pathGeom = new THREE.BufferGeometry();
+    pathGeom.setAttribute('position',
+      new THREE.BufferAttribute(new Float32Array(PATH_MAX * 3), 3));
+    pathGeom.setDrawRange(0, 0);
+    const pathLine = new THREE.Line(
+      pathGeom,
+      new THREE.LineBasicMaterial({ color: 0x9be564 })
+    );
+    pathLine.frustumCulled = false;
+    scene.add(pathLine);
+
+    function updatePoseHud() {
+      if (!lastRobotPose) return;
+      hud.pose.textContent =
+        `x ${lastRobotPose.x.toFixed(2)}  y ${lastRobotPose.y.toFixed(2)}`
+        + `  yaw ${(lastRobotPose.yaw * 180 / Math.PI).toFixed(0)}°`;
+    }
+
+    let lastRobotPose = null;            // {x, y, yaw} in the display frame
+
+    // ----------------------------------------------------- websocket feed
+    // Binary frame layout (little endian, 24-byte header):
+    //   0   u8   msg type (1 = cloud, 2 = nav path)
+    //   1   u8   flags: bit0 = robot pose present
+    //   2   u16  reserved
+    //   4   u32  point count N
+    //   8   f32  robot x
+    //   12  f32  robot y
+    //   16  f32  robot z
+    //   20  f32  robot yaw (radians)
+    //   24  N * 3 x f32 positions   (x, y, z)
+    //       N * 3 x u8   colors     (only for type 1)
+    const HEADER_BYTES = 24;
+    const MSG_CLOUD = 1;
+    const MSG_PATH = 2;
+    let ws = null;
+    let streamFrames = 0;
+    let lastStreamCount = 0;
+    let streamFps = 0;
+    let lastStreamTime = performance.now();
+    let wantedRobot = 'Luna';
+
+    function connect() {
+      const params = new URLSearchParams(window.location.search);
+      wantedRobot = params.get('robot') || 'Luna';
+      const ns = wantedRobot.toLowerCase();
+      hud.robot.textContent = wantedRobot;
+      hud.topic.textContent = '/${ns}/go2/restamped/cloud_base'.replace('${ns}', ns);
+
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      // Same origin: the viewer page and the socket are served by the same
+      // side-car process, so no hard-coded host/port here.
+      const url = `${proto}://${window.location.host}/ws/foxglove?robot=${encodeURIComponent(wantedRobot)}`;
+
+      setStatus('waiting', 'connecting…');
+      setError(null);
+
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('waiting', 'waiting for point cloud…');
+        setError(null);
+        ws.send(JSON.stringify({ type: 'subscribe', robot: wantedRobot }));
+      };
+
+      ws.onmessage = (evt) => {
+        if (typeof evt.data === 'string') {
+          // JSON control messages (map texture, robot list, errors).
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'map' && msg.png) applyFloorTexture(msg);
+            else if (msg.type === 'error') { setStatus('error', msg.message); setError(msg.detail || ''); }
+            else if (msg.type === 'status') setStatus('waiting', msg.message);
+            else if (msg.type === 'robots') setStatus('waiting', 'waiting for point cloud…');
+          } catch (e) { console.warn('bad control message', e); }
+          return;
+        }
+        applyCloudFrame(evt.data);
+      };
+
+      ws.onclose = () => {
+        setStatus('offline', 'disconnected — reconnecting in 2 s');
+        ws = null;
+        setTimeout(connect, 2000);
+      };
+      ws.onerror = () => { /* onclose follows and drives the retry */ };
+    }
+
+    function applyCloudFrame(buf) {
+      if (buf.byteLength < HEADER_BYTES) return;
+      const dv = new DataView(buf);
+      const type = dv.getUint8(0);
+      const flags = dv.getUint8(1);
+      const n = dv.getUint32(4, true);
+
+      // Robot pose is in the header, so the marker keeps moving smoothly even
+      // when the point cloud itself is momentarily empty.
+      const pose = {
+        x: dv.getFloat32(8, true),
+        y: dv.getFloat32(12, true),
+        z: dv.getFloat32(16, true),
+        yaw: dv.getFloat32(20, true),
+      };
+      if (flags & 1) lastRobotPose = pose;
+
+      if (type === MSG_PATH) {
+        applyPathFrame(buf, n);
+        return;
+      }
+      if (type !== MSG_CLOUD || n <= 0) return;
+      if (buf.byteLength < HEADER_BYTES + n * 15) return;
+
+      const count = Math.min(n, MAX_POINTS);
+      const pos = new Float32Array(buf, HEADER_BYTES, n * 3);
+      const colBytes = new Uint8Array(buf, HEADER_BYTES + n * 12, n * 3);
+
+      positions.set(pos.subarray(0, count * 3));
+      // Colours arrive as uint8 (three bytes per point, 0-255) because that is
+      // a quarter of the float32 size on the wire. The attribute is a plain
+      // float buffer with normalized=false, so Three.js uses the numbers as
+      // linear colour directly and anything above 1.0 just clamps -- every
+      // point would render solid white. Divide here to map 0-255 onto 0-1.
+      for (let i = 0, j = 0; i < count * 3; i += 3, j += 3) {
+        colors[i] = colBytes[j] / 255;
+        colors[i + 1] = colBytes[j + 1] / 255;
+        colors[i + 2] = colBytes[j + 2] / 255;
+      }
+      pointCount = count;
+      cloudGeom.attributes.position.needsUpdate = true;
+      cloudGeom.attributes.color.needsUpdate = true;
+      cloudGeom.setDrawRange(0, pointCount);
+
+      streamFrames++;
+      lastStreamCount = pointCount;
+      const now = performance.now();
+      if (now - lastStreamTime > 1000) {
+        streamFps = Math.round((streamFrames * 1000) / (now - lastStreamTime));
+        streamFrames = 0;
+        lastStreamTime = now;
+      }
+      setStatus('streaming', 'streaming');
+
+      hud.points.textContent = lastStreamCount.toLocaleString();
+      hud.stream.textContent = `${streamFps} fps`;
+      updatePoseHud();
+    }
+
+    function applyPathFrame(buf, n) {
+      if (n <= 0) {
+        pathGeom.setDrawRange(0, 0);
+        return;
+      }
+      const count = Math.min(n, PATH_MAX);
+      const attr = pathGeom.attributes.position;
+      const pos = new Float32Array(buf, HEADER_BYTES, n * 3);
+      attr.array.set(pos.subarray(0, count * 3));
+      attr.needsUpdate = true;
+      pathGeom.setDrawRange(0, count);
+      pathGeom.computeBoundingSphere();
+    }
+
+    function applyFloorTexture(msg) {
+      const img = new Image();
+      img.onload = () => {
+        const tex = new THREE.Texture(img);
+        tex.needsUpdate = true;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        floorMat.map = tex;
+        floorMat.needsUpdate = true;
+
+        // msg.width / msg.height / msg.resolution / msg.origin_x / msg.origin_y
+        // describe the occupancy grid. PlaneGeometry is centred, so shift it by
+        // half a cell and then offset by the grid origin to line it up with the
+        // map frame the point cloud is already in.
+        const w = msg.width * msg.resolution;
+        const h = msg.height * msg.resolution;
+        const cx = msg.origin_x + w / 2;
+        const cy = msg.origin_y + h / 2;
+        floor.geometry.dispose();
+        floor.geometry = new THREE.PlaneGeometry(w, h);
+        floor.position.set(cx, 0, -cy);
+        floor.visible = true;
+
+        // Scale the grid helper to roughly the map extent.
+        const span = Math.max(w, h, 10);
+        grid.scale.setScalar(span / 40);
+        grid.position.set(cx, 0, -cy);
+      };
+      img.src = 'data:image/png;base64,' + msg.png;
+    }
+
+    // -------------------------------------------------------------- camera
+    // Both helpers work in the display frame, so a map-frame y is negated on
+    // the way in, matching the point cloud's (x, z, -y) conversion.
+    function frameOnRobot() {
+      const cx = lastRobotPose ? lastRobotPose.x : 0;
+      const cz = lastRobotPose ? -lastRobotPose.y : 0;
+      controls.target.set(cx, 0.4, cz);
+      camera.position.set(cx + 3.2, 2.6, cz + 3.2);
+      controls.update();
+    }
+    function topView() {
+      const cx = lastRobotPose ? lastRobotPose.x : 0;
+      const cz = lastRobotPose ? -lastRobotPose.y : 0;
+      controls.target.set(cx, 0, cz);
+      camera.position.set(cx, 18, cz + 0.001);
+      controls.update();
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'f' || e.key === 'F') frameOnRobot();
+      else if (e.key === 't' || e.key === 'T') topView();
+      else if (e.key === 'g' || e.key === 'G') grid.visible = !grid.visible;
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // --------------------------------------------------------------- loop
+    let renderFrames = 0;
+    let lastRenderTime = performance.now();
+    let renderFps = 0;
+    let started = false;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (lastRobotPose) {
+        // Pose arrives in the ROS map frame (Z-up); the scene is Y-up with the
+        // same (x, z, -y) conversion the backend used for the cloud, so the
+        // marker and the points cannot drift apart.
+        // Height comes from the pose so the body stays with the cloud it
+        // generated rather than being pinned to z=0.
+        robotGroup.position.set(lastRobotPose.x, lastRobotPose.z, -lastRobotPose.y);
+        // ROS yaw turns about +Z; in the display frame that is -Y, hence the
+        // negation. (Signed consistently with the axis flip above.)
+        robotGroup.rotation.y = -lastRobotPose.yaw;
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+
+      if (lastRobotPose) updatePoseHud();
+
+      renderFrames++;
+      const now = performance.now();
+      if (now - lastRenderTime > 1000) {
+        renderFps = Math.round((renderFrames * 1000) / (now - lastRenderTime));
+        renderFrames = 0;
+        lastRenderTime = now;
+        hud.fps.textContent = `${renderFps} fps`;
+      }
+      if (!started) { started = true; hud.loading.style.display = 'none'; }
+    }
+
+    camera.position.set(3.2, 2.6, 3.2);
+    controls.target.set(0, 0.4, 0);
+    controls.update();
+
+    connect();
+    animate();
+  </script>
+</body>
+</html>

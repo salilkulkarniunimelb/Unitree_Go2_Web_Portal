@@ -254,6 +254,9 @@ fi
 
 # --- 7) Tunnel + open browser --------------------------------------------------
 PATROL_PORT="${PATROL_PORT:-8766}"
+# The "Foxglove view" tab's 3D viewer runs as a side-car next to the portal and
+# is restarted with it, so -- like 7860 -- it only needs its port forwarded.
+FOXGLOVE_PORT="${FOXGLOVE_PORT:-8767}"
 
 # A local port being LISTENing is NOT proof of a working tunnel: an `ssh -N -L`
 # orphaned by a VPN drop keeps the port bound while forwarding nowhere, and the
@@ -361,6 +364,9 @@ fi
 # untouched, so a planner you started locally is never killed by this script.
 if open_tunnel "$PATROL_PORT" "patrol planner" listen ssh; then
     echo "  -> Start the patrol planner separately for the 'Patrolling' tab to render."
+fi
+if open_tunnel "$FOXGLOVE_PORT" "3D viewer" listen ssh; then
+    echo "  -> Port $FOXGLOVE_PORT forwarded; the 'Foxglove view' tab will render."
 fi
 
 echo ""

@@ -24,6 +24,9 @@ Layout mirrors the Hivemind mission dashboard:
     - Live occupancy map (center) + live camera (right)
     - Explorer controls (Start/Stop Exploring) + log tail
     - Telemetry + status footer
+    - "Foxglove view": a Foxglove-style 3D lidar page, served by the
+      side-car web_backend/foxglove_viewer.py on port 8767 and embedded in an
+      iframe, so orbit / pan / zoom work exactly like Foxglove's 3D panel.
 
 "Start Exploring" runs the split-compute explorer for the robot selected in the
 fleet panel: it starts that robot's Zenoh bridge, builds go2_hardware_autonomy
@@ -35,9 +38,8 @@ happen in the robot_hivemind compute container. The launch is detached once
 started, so exploration survives the browser closing or the portal restarting.
 
 Working features stream live (map, camera, battery, pose). Features not yet
-implemented (scenario/operations steps, 3D Foxglove view, ROS gateway, 5G
-link, RealSense/YOLO streams) have been removed from the layout until they are
-wired up.
+implemented (scenario/operations steps, ROS gateway, 5G link, RealSense/YOLO
+streams) have been removed from the layout until they are wired up.
 
 The page ALWAYS loads. Every section shows a "Waiting for ..." placeholder
 until its topic starts publishing. Click the map to publish a navigation goal
@@ -58,6 +60,7 @@ import queue
 import threading
 import time
 import base64
+import json
 from collections import deque
 
 import cv2
@@ -218,6 +221,136 @@ def _draw_plan(canvas, pts, dark, bright):
 
 SERV_NAME = "0.0.0.0"
 SERV_PORT = 7860
+
+# ----------------------- Foxglove-style 3D view -----------------------
+# The 3D view is a separate process (web_backend/foxglove_viewer.py) serving a
+# Three.js scene plus a WebSocket point-cloud feed. The portal only embeds it,
+# so nothing here can break the map/camera pages if the viewer has a bad day.
+FOXGLOVE_PORT = 8767
+FOXGLOVE_URL = f"http://localhost:{FOXGLOVE_PORT}"
+FOXGLOVE_VIEWER_MODULE = "web_backend.foxglove_viewer"
+
+
+def _foxglove_viewer_alive():
+    """Is the viewer serving? Probed over HTTP, not by pid: the viewer is
+    started by a supervisor thread that can be restarted under us, and a pid
+    check would report a stale answer."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{FOXGLOVE_URL}/health", timeout=2) as r:
+            return 200 <= r.status < 300, r.read()
+    except Exception:
+        return False, None
+
+
+def _foxglove_status_html(note=None):
+    """One-line status strip under the 3D viewer: whether the viewer process is
+    up, and if so whether the selected robot's cloud is actually arriving.
+    Deliberately a cheap /health GET on a 2 s timer."""
+    alive, body = _foxglove_viewer_alive()
+    if not alive:
+        return (
+            f'<div style="padding:8px 10px;border-radius:6px;'
+            f'background:rgba(180,50,50,.18);border:1px solid rgba(255,120,120,.35);'
+            f'font-size:13px;color:#ffb4ab;">'
+            f'3D viewer not responding on port {FOXGLOVE_PORT}. '
+            f'Starting it… (the rest of the dashboard is unaffected)</div>'
+        )
+
+    bits = []
+    try:
+        info = json.loads(body.decode())
+    except Exception:
+        return (
+            '<div style="padding:8px 10px;font-size:13px;color:#c8c8d0;">'
+            '3D viewer online.</div>'
+        )
+
+    bits.append(f"viewer online · port {info.get('port', FOXGLOVE_PORT)}")
+    bits.append(f"{info.get('max_points_per_frame')} pts/frame @ "
+                f"{info.get('target_fps')} fps")
+    robots = info.get("robots") or {}
+    for ns, st in robots.items():
+        label = ns.capitalize()
+        age = st.get("last_cloud_age")
+        if st.get("cloud_msgs", 0) > 0:
+            fresh = f"{age:.1f}s ago" if age is not None else "just now"
+            cloud = f"☁ {st['buffered']:,} pts ({fresh})"
+        else:
+            cloud = "☁ no cloud yet"
+        extra = []
+        if st.get("pose_source"):
+            extra.append(f"pose:{st['pose_source']}")
+        if st.get("has_map"):
+            extra.append("map ✓")
+        if st.get("plan_points"):
+            extra.append(f"path:{st['plan_points']}")
+        if st.get("dropped_no_pose"):
+            extra.append(f"waiting for pose ({st['dropped_no_pose']:,} pts held)")
+        if st.get("last_error"):
+            extra.append(f"error: {st['last_error'][:80]}")
+        bits.append(f"{label}: {cloud}"
+                    + (f" · {' · '.join(extra)}" if extra else ""))
+
+    tail = f" <span style='opacity:.65'>{note}</span>" if note else ""
+    return (
+        '<div style="padding:8px 10px;border-radius:6px;'
+        'background:rgba(70,110,180,.16);border:1px solid rgba(140,180,240,.3);'
+        'font-size:12px;color:#cfe0ff;">'
+        + " · ".join(bits) + tail + "</div>"
+    )
+
+
+def _foxglove_probe(robot):
+    """gr.Timer callback for the 3D view's status strip."""
+    return _foxglove_status_html()
+
+
+def _start_foxglove_viewer():
+    """Supervise web_backend/foxglove_viewer.py in its own process.
+
+    Runs on a daemon thread started from main(). It only ever touches the
+    viewer: it can never take the portal down, and it restarts the viewer after
+    a crash or a port clash, which is the whole reason the tab is usable without
+    anyone having to log into the container.
+    """
+    import subprocess
+    import sys
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(root, "foxglove_viewer.log")
+
+    def loop():
+        backoff = 5.0
+        while True:
+            if _foxglove_viewer_alive()[0]:
+                time.sleep(10.0)
+                continue
+            try:
+                with open(log_path, "ab", buffering=0) as log:
+                    log.write(f"\n=== viewer start "
+                              f"{time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+                              .encode())
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", FOXGLOVE_VIEWER_MODULE],
+                        cwd=root,
+                        stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                    )
+                    # Wait for the child, but keep the check alive: if the
+                    # portal is restarted this thread dies with it anyway.
+                    proc.wait()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[foxglove] supervisor: {exc!r}", flush=True)
+
+            if _foxglove_viewer_alive()[0]:
+                backoff = 5.0
+            else:
+                backoff = min(backoff * 2, 60.0)
+            time.sleep(backoff)
+
+    threading.Thread(target=loop, name="foxglove-supervisor", daemon=True).start()
 
 # ----------------------- import rclpy + msgs (defensive) -------------
 import rclpy
@@ -1743,6 +1876,15 @@ def main():
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
 
+    # Side-car for the "Foxglove view" tab. Started here (rather than from
+    # boot.sh / lab_start.sh) so one deploy unit covers everything, but in its
+    # own process and behind its own health check, so it can neither delay nor
+    # take down this dashboard.
+    try:
+        _start_foxglove_viewer()
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[foxglove] could not start viewer supervisor: {_exc!r}", flush=True)
+
     theme = gr.themes.Soft(
         primary_hue=gr.themes.colors.blue,
         secondary_hue=gr.themes.colors.blue,
@@ -2132,6 +2274,68 @@ def main():
                     '<iframe src="http://localhost:8766/" '
                     'style="width:100%; height:900px; border:0; '
                     'border-radius:8px; background:#0b0b12;"></iframe>'
+                )
+
+            # ================================================================
+            # TAB 4: FOXGLOVE VIEW (3D lidar map, orbit/pan/zoom)
+            # A separate viewer process (web_backend/foxglove_viewer.py) serves
+            # a Three.js scene plus a WebSocket point-cloud feed on port 8767
+            # (host networking, same container). The dashboard only embeds it
+            # in an iframe, like the patrol planner on 8766, and the port is
+            # forwarded by the SSH tunnel like the others.
+            #
+            # Deliberately a separate process: the portal is on a boot.sh
+            # watchdog because it dies on its own often enough to matter, and a
+            # crash in a WebGL/WebSocket path must never take the working map
+            # and camera pages down with it. If the viewer is down the iframe
+            # just says so and every other tab is unaffected.
+            # ================================================================
+            with gr.Tab("Foxglove view", id="foxglove-ui"):
+                gr.Markdown("#### 3D LIDAR VIEW (FOXGLOVE-STYLE)")
+                gr.Markdown(
+                    "Live point cloud in the map frame, accumulated as the robot "
+                    "drives. Left-drag orbits, right-drag pans, wheel zooms — "
+                    "the same camera controls as Foxglove's 3D panel. The robot "
+                    "and its Nav2 path are shown alongside."
+                )
+                foxglove_robot_dd = gr.Dropdown(
+                    choices=list(ROBOTS.keys()),
+                    value="Luna",
+                    label="Robot",
+                    interactive=True,
+                    elem_classes=["foxglove-robot"],
+                )
+                foxglove_status = gr.Markdown(
+                    value=_foxglove_status_html("starting"),
+                )
+                foxglove_view = gr.HTML(
+                    value='<iframe id="foxglove_frame" '
+                          'src="http://localhost:8767/?robot=Luna" '
+                          'style="width:100%; height:820px; border:0; '
+                          'border-radius:8px; background:#0b0b12;"></iframe>'
+                )
+
+                def _on_foxglove_robot(name):
+                    # Reload the iframe rather than rebuild it: the viewer owns
+                    # the WebSocket, and a src change restarts it cleanly.
+                    return (
+                        f'<iframe id="foxglove_frame" '
+                        f'src="http://localhost:8767/?robot={name}" '
+                        f'style="width:100%; height:820px; border:0; '
+                        f'border-radius:8px; background:#0b0b12;"></iframe>',
+                        _foxglove_status_html(f"switched to {name}"),
+                    )
+
+                foxglove_robot_dd.change(
+                    _on_foxglove_robot, inputs=foxglove_robot_dd,
+                    outputs=[foxglove_view, foxglove_status],
+                )
+
+                foxglove_status_timer = gr.Timer(2.0)
+                foxglove_status_timer.tick(
+                    _foxglove_probe,
+                    inputs=[foxglove_robot_dd],
+                    outputs=foxglove_status,
                 )
 
     demo.launch(
