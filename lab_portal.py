@@ -24,7 +24,7 @@ Layout mirrors the Hivemind mission dashboard:
     - Live occupancy map (center) + live camera (right)
     - Explorer controls (Start/Stop Exploring) + log tail
     - Telemetry + status footer
-    - "Foxglove view": a Foxglove-style 3D lidar page, served by the
+    - "3D Map": a Foxglove-style 3D lidar page, served by the
       side-car web_backend/foxglove_viewer.py on port 8767 and embedded in an
       iframe, so orbit / pan / zoom work exactly like Foxglove's 3D panel.
 
@@ -1897,7 +1897,7 @@ def main():
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
 
-    # Side-car for the "Foxglove view" tab. Started here (rather than from
+    # Side-car for the "3D Map" tab. Started here (rather than from
     # boot.sh / lab_start.sh) so one deploy unit covers everything, but in its
     # own process and behind its own health check, so it can neither delay nor
     # take down this dashboard.
@@ -2311,7 +2311,7 @@ def main():
             # and camera pages down with it. If the viewer is down the iframe
             # just says so and every other tab is unaffected.
             # ================================================================
-            with gr.Tab("Foxglove view", id="foxglove-ui"):
+            with gr.Tab("3D Map", id="foxglove-ui"):
                 # The intro heading and blurb were removed at the operator's
                 # request. The tab label above is the only remaining label for
                 # this view.
