@@ -187,6 +187,19 @@ MISSION_TOPIC = os.environ.get(
 # upstream shows up instead of silently reading as "idle".
 MISSION_STATES = ("IDLE", "EXPLORING", "MAP_COMPLETE", "READY_FOR_PATROL")
 
+# The mission topic is ~5 Hz, so this is ~50 missed messages before the readout is
+# called stale. Without it the last state ever seen is displayed forever as if it
+# were live: when the explorer is stopped the publisher simply disappears, the
+# value never changes again, and a change-gated push sends nothing further -- so
+# the HUD would keep claiming "Exploring" hours after exploration ended.
+MISSION_STALE_SECONDS = 10.0
+
+# Even while stale the frame is refreshed on this interval, so the "no update
+# for Ns" figure on screen keeps counting instead of freezing at the moment the
+# feed died. One small JSON frame every couple of seconds is nothing next to the
+# cloud at 10 fps.
+MISSION_PUSH_INTERVAL = 2.0
+
 # Wire header: u8 type, u8 flags, u16 reserved, u32 count, f32 x, y, z, yaw.
 # Defined once and reused by both frame encoders so the two can never disagree
 # about the layout the browser decodes.
@@ -1308,6 +1321,10 @@ async def client_handler(ws, bridge):
         # None means "nothing sent yet", so the first real state is always
         # pushed even if it happens to be the first key we see.
         sent_mission = None
+        last_mission_push = 0.0
+        # Grace period before reporting "no mission manager at all" rather than
+        # waiting silently; measured per connection.
+        pump_started = time.time()
         while not stop.is_set():
             t0 = time.time()
             try:
@@ -1363,15 +1380,40 @@ async def client_handler(ws, bridge):
                 # finished its thread -- capturing it then would latch None forever
                 # and the status would silently never appear.
                 mission = bridge.mission
-                if mission is not None:
-                    key = mission.snapshot()
-                    if key[0] is not None and key != sent_mission:
-                        sent_mission = key
+                now_m = time.time()
+                # Two cases must reach the browser:
+                #   - we have a state: report it, and report staleness once it
+                #     ages out;
+                #   - we have none at all, because the mission manager was never
+                #     up or has already died. Waiting for a first message before
+                #     saying anything leaves the HUD on "connecting..." forever,
+                #     which reads as slow start-up rather than a missing
+                #     publisher. So once the grace period passes, report the
+                #     absence explicitly.
+                have = mission is not None and mission.state is not None
+                grace_over = now_m - pump_started >= MISSION_STALE_SECONDS
+                if have or grace_over:
+                    age = (None if mission is None or not mission.last_wall
+                           else now_m - mission.last_wall)
+                    stale = age is None or age > MISSION_STALE_SECONDS
+                    key = None if mission is None else mission.snapshot()
+                    # Push on a real transition, or on the slow keepalive tick
+                    # once stale so the age keeps counting. Pure value-gating
+                    # would go silent forever when the publisher dies, which is
+                    # exactly the case where the operator most needs to be told.
+                    if (key, stale) != sent_mission \
+                            or now_m - last_mission_push >= MISSION_PUSH_INTERVAL:
+                        sent_mission = (key, stale)
+                        last_mission_push = now_m
                         await ws.send(json.dumps({
                             "type": "mission",
-                            "state": key[0],
-                            "explorer_robot": mission.explorer_robot,
-                            "completion_status": mission.completion_status,
+                            "state": None if key is None else key[0],
+                            "stale": stale,
+                            "age": None if age is None else round(age, 1),
+                            "explorer_robot": None if mission is None
+                                              else mission.explorer_robot,
+                            "completion_status": None if mission is None
+                                                else mission.completion_status,
                             "known_states": list(MISSION_STATES),
                         }))
 

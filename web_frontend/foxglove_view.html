@@ -147,6 +147,24 @@
 
     function renderMission(msg) {
       const state = String(msg.state || '').trim().toUpperCase();
+
+      // A stale feed must never render as a confident "Exploring". When the
+      // explorer is stopped its publisher just vanishes, the value stops
+      // changing, and a change-gated push would leave the last state up
+      // forever -- so the dog looks like it is still exploring hours after it
+      // stopped. Grey and explicit beats a green lie.
+      if (msg.stale) {
+        const age = msg.age;
+        const how = age == null ? 'never received any update'
+          : `no update for ${Math.round(age)}s`;
+        const last = state ? ` (last seen: ${state})` : '';
+        hud.mission.innerHTML =
+          `<b style="color:#9aa0aa">Mission state unavailable</b>` +
+          `<span style="color:#6f7684; font-weight:400"> ${how} — ` +
+          `the mission manager looks stopped${last}</span>`;
+        return;
+      }
+
       if (!state) return;
       const known = MISSION_LABELS[state];
       // Unknown state: amber rather than a "known" colour, so it is visibly
