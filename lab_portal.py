@@ -2338,19 +2338,37 @@ def main():
                 # orders components by declaration order. The wiring below has
                 # to stay after this, because .click()/.tick() read explore_log
                 # when they are registered, so it must already exist by then.
-                gr.Markdown("#### EXPLORER LOG")
-                explore_log = gr.Textbox(
-                    show_label=False, lines=12, max_lines=12,
-                    interactive=False)
+                with gr.Column(visible=False) as logs_panel:
+                    gr.Markdown("#### EXPLORER LOG")
+                    explore_log = gr.Textbox(
+                        show_label=False, lines=12, max_lines=12,
+                        interactive=False)
 
-                # ---------- BOTTOM: GOAL SETTING LOG ----------
-                # Shares the log textbox with the explorer buttons above, for
-                # the same reason they are declared together: the callbacks
-                # close over goal_log, so it must exist before they are wired.
-                gr.Markdown("#### GOAL SETTING LOG")
-                goal_log = gr.Textbox(
-                    show_label=False, lines=8, max_lines=8,
-                    interactive=False)
+                    # ---------- BOTTOM: GOAL SETTING LOG ----------
+                    # Shares the log textbox with the explorer buttons above,
+                    # for the same reason they are declared together: the
+                    # callbacks close over goal_log, so it must exist before
+                    # they are wired.
+                    gr.Markdown("#### GOAL SETTING LOG")
+                    goal_log = gr.Textbox(
+                        show_label=False, lines=8, max_lines=8,
+                        interactive=False)
+
+                # ---------- SHOW LOGS ----------
+                # Both logs are inside logs_panel, which starts hidden, so the
+                # button at the foot of the page is the only thing revealed.
+                # The logs themselves are untouched: the 2s timer still writes
+                # to both textboxes whether or not they are on screen, so
+                # pressing Show Logs after a run shows what already accumulated.
+                show_logs_btn = gr.Button(
+                    "Show Logs", variant="secondary")
+
+                def on_show_logs():
+                    return gr.Column(visible=True)
+
+                show_logs_btn.click(
+                    on_show_logs, inputs=None, outputs=logs_panel,
+                    api_name="show_logs")
 
                 # api_name exposes these as Gradio API endpoints
                 # (POST /gradio_api/call/start_exploring with {"data": ["Luna"]}),
