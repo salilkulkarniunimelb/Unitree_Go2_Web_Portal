@@ -63,7 +63,7 @@ LAUNCH_LOGFILE=/workspace/explorer_launch.log
 PATROL_PIDFILE=/workspace/.patrol_launch.pid
 PATROL_LOGFILE=/workspace/patrol_launch.log
 # The completed map the robots localise on after exploring.
-PATROL_MAP=/workspace/hardware_code/maps/amcl_completed_map.yaml
+PATROL_MAP=/workspace/hardware_code/maps/luna_amcl_completed_map20261001.yaml
 
 PHASE="[explorer] PHASE="
 log()  { echo "[explorer] $*"; }
