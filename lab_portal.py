@@ -101,6 +101,7 @@ LUNA_TOPICS = {
     "goal":    "/luna/goal_pose",
     "initialpose": "/luna/initialpose",
     "plan":    "/luna/plan",
+    "map_odom": "/luna/go2/split_compute/map_odom_correction",
 }
 
 ASTRO_TOPICS = {
@@ -113,6 +114,7 @@ ASTRO_TOPICS = {
     "goal":    "/astro/goal_pose",
     "initialpose": "/astro/initialpose",
     "plan":    "/astro/plan",
+    "map_odom": "/astro/go2/split_compute/map_odom_correction",
 }
 
 ROBOTS = {
@@ -188,6 +190,11 @@ GOAL_REACHED_TOLERANCE = 1.0
 # fresh; after this many seconds without a sample we fall back to the live
 # odometry heading re-anchored into the map frame.
 AMCL_FRESH_SECS = 3.0
+
+# SLAM's map<-odom correction is published continuously while exploring, so it
+# can be trusted for about as long as AMCL is trusted. If it goes quiet we stop
+# using it and fall back to the older plan-anchored odom placement.
+ODOM_FRESH_SECS = 3.0
 
 # Per-robot visual identity. NOTE: cv2 draws BGR but Gradio displays RGB, so
 # these tuples equal the browser colours (channel 0 = red on screen).
@@ -388,7 +395,11 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import (
+    PoseStamped,
+    PoseWithCovarianceStamped,
+    TransformStamped,
+)
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Image
 
@@ -753,6 +764,16 @@ class RobotState:
         self.odom_to_map_yaw = None       # learned odom -> map rotation offset
         self.plan_start_yaw = None        # heading at the plan start (map frame)
         self._last_amcl_wall = 0.0        # last AMCL sample (wall clock)
+        # --- SLAM map <- odom (exploring only) --------------------------------
+        # While exploring, AMCL is not publishing AND Nav2 is not planning, so
+        # there is no /plan to anchor the odom body against. The odom frame is
+        # then drawn as if it were 'map', which is why the body and heading sat
+        # off the route while the 3D view tracked it correctly. The lidar SLAM
+        # stack publishes the real map<-odom transform on
+        # /<ns>/go2/split_compute/map_odom_correction; composing it with odom
+        # reproduces exactly what the 3D viewer already does.
+        self.map_from_odom = None        # (x, y, yaw) map<-odod translation/rotation
+        self.map_from_odom_stamp = 0.0
         # --- initial pose (set via map drag) ---
         self.initial_pose = None          # (wx, wy, yaw) pending/confirmed initial pose
         self.last_initial = None
@@ -1006,22 +1027,65 @@ class RobotState:
             return self.plan_start_yaw
         return self.yaw
 
+    def map_odom_cb(self, msg):
+        """SLAM's map <- odom correction, published while exploring.
+
+        This is a geometry_msgs/msg/TransformStamped whose transform composes
+        with the odom pose to give the map-frame pose. Only the planar part
+        matters here (the 2D map is x/y); roll/pitch are dropped.
+        """
+        try:
+            t = msg.transform.translation
+            q = msg.transform.rotation
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            self.map_from_odom = (t.x, t.y, yaw)
+            self.map_from_odom_stamp = time.time()
+        except Exception as e:
+            self.node.get_logger().error(
+                f"[{self.name}] map_odom_cb failed: {e}")
+
+    def _odom_in_map(self):
+        """Odom pose lifted into the map frame by SLAM's correction, or None.
+
+        Same composition the 3D viewer uses: translate the odom position by the
+        correction and add the correction's rotation to the odom heading.
+        """
+        if self.map_from_odom is None or self.last_odom is None:
+            return None
+        if time.time() - self.map_from_odom_stamp > ODOM_FRESH_SECS:
+            return None
+        dx, dy, dyaw = self.map_from_odom
+        ox, oy = self.last_odom
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        yaw = _norm_angle((self.odom_yaw if self.odom_yaw is not None
+                           else self.yaw) + dyaw)
+        return (ox * c - oy * s + dx, ox * s + oy * c + dy, yaw)
+
     def map_pose(self):
         """Best available robot position expressed in the 'map' frame.
 
         Returns (x, y, yaw) or None. Order of preference:
-          1. AMCL pose, as long as it is still publishing (fresh samples).
-          2. Odom re-anchored into the map frame via the offset taken from the
+          1. AMCL pose, as long as it is still publishing (fresh samples). This
+             is the normal path whenever the robot is driving to a goal, so
+             navigating behaviour is unchanged by the exploring fallback below.
+          2. Odom lifted into the map frame by SLAM's map<-odom correction.
+             Used while exploring, where AMCL is silent and Nav2 publishes no
+             plan, and therefore no other map-frame anchor exists.
+          3. Odom re-anchored into the map frame via the offset taken from the
              Nav2 plan's start pose (used while navigating without AMCL / when
              AMCL stalls, and kept after arrival so the body does not jump
              frames). The heading here is LIVE (re-anchored odom yaw).
-          3. Nav2 plan start pose (map frame).
-          4. Raw odom (unreliable frame, last resort before any map data)."""
+          4. Nav2 plan start pose (map frame).
+          5. Raw odom (unreliable frame, last resort before any map data)."""
         amcl_fresh = (self.pose_from_amcl
                       and time.time() - self._last_amcl_wall <= AMCL_FRESH_SECS)
         if amcl_fresh and self.robot_pose is not None:
             return (self.robot_pose.position.x,
                     self.robot_pose.position.y, self.yaw)
+        lifted = self._odom_in_map()
+        if lifted is not None:
+            return lifted
         if (self.odom_to_map is not None and self.last_odom is not None):
             yaw = self._live_map_yaw()
             return (self.last_odom[0] + self.odom_to_map[0],
@@ -1639,6 +1703,15 @@ class LabRobotNode(Node):
             # on /luna|astro/plan; draw it on the map so the operator can see the
             # route the robot is about to take before/while it drives.
             self.create_subscription(Path, topics["plan"], robot.plan_cb, 10)
+            # SLAM's map<-odom correction, published while exploring. This is the
+            # only map-frame anchor available then: AMCL is silent and Nav2
+            # publishes no plan, so without it the odom body is drawn in the
+            # wrong frame. TRANSIENT_LOCAL like the other latched SLAM topics.
+            map_odom_topic = topics.get("map_odom")
+            if map_odom_topic:
+                self.create_subscription(
+                    TransformStamped, map_odom_topic, robot.map_odom_cb,
+                    qos_profile=map_qos)
             if Go2FrontVideoData is not None and CAMERA_SOURCE != "webrtc":
                 # Camera arrives as high-rate (~250Hz+) fragmented H.264. A
                 # RELIABLE depth-10 subscription drops messages under the burst
@@ -1687,6 +1760,8 @@ class LabRobotNode(Node):
                             and time.time() - robot._last_amcl_wall
                             <= AMCL_FRESH_SECS):
                         src = "amcl"
+                    elif robot._odom_in_map() is not None:
+                        src = "slam"
                     elif robot.odom_to_map_yaw is not None:
                         src = "odom+off"
                     elif robot.plan_start_yaw is not None:
