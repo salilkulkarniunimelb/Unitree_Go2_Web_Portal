@@ -320,6 +320,20 @@ def _foxglove_status_html(note=None):
     )
 
 
+def _goto_tab(tab_id):
+    """Click handler that selects another tab.
+
+    Gradio switches tabs by making gr.Tabs itself an output and returning
+    gr.Tabs(selected=...). A button click has no inputs to read the target
+    from, so the id is bound here and the returned handler takes none.
+
+    Deliberately a pair of buttons rather than one 2D/3D dropdown: a control
+    mirroring the tab bar would be a second source of truth for which tab is
+    active, and it could not represent the other two tabs at all.
+    """
+    return lambda: gr.Tabs(selected=tab_id)
+
+
 def _foxglove_probe(robot):
     """gr.Timer callback for the 3D view's status strip."""
     return _foxglove_status_html()
@@ -464,6 +478,9 @@ DASHBOARD_CSS = """
     /* Foxglove status strip: sits under the iframe, so it needs its own gap
        above rather than the default block spacing. */
     .foxglove-status{margin-top:10px !important;}
+    /* 2D <-> 3D page hops. Secondary weight so they read as navigation, not
+       as a control that changes anything on the current page. */
+    .switch-view-btn{margin-top:10px !important;font-weight:600 !important;}
 
     
 
@@ -1997,6 +2014,17 @@ def main():
 
                         gr.HTML('<div style="text-align:center;">🔴 Luna · 🟦 Astro</div>')
 
+                        # Jumps to the 3D view of the same world. Purely
+                        # navigation: no data path, no subscription and no timer
+                        # is touched, and the 2D map keeps running untouched on
+                        # its own tab.
+                        switch_to_3d_btn = gr.Button(
+                            "Switch to 3D", variant="secondary",
+                            elem_classes=["switch-view-btn"])
+                        switch_to_3d_btn.click(
+                            _goto_tab("foxglove-ui"),
+                            inputs=None, outputs=page_tabs)
+
                     # ---------- RIGHT: LIVE CAMERA ----------
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
                         gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Live Camera</h2>')
@@ -2335,6 +2363,13 @@ def main():
                     value=_foxglove_status_html("starting"),
                     elem_classes=["foxglove-status"],
                 )
+                # The reciprocal hop, so "Switch to 3D" is not a one-way door.
+                switch_to_2d_btn = gr.Button(
+                    "Switch to 2D", variant="secondary",
+                    elem_classes=["switch-view-btn"])
+                switch_to_2d_btn.click(
+                    _goto_tab("mapping"),
+                    inputs=None, outputs=page_tabs)
 
                 def _on_foxglove_robot(name):
                     # Reload the iframe rather than rebuild it: the viewer owns
