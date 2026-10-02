@@ -2153,25 +2153,6 @@ def main():
                 # ================================================================
                 with gr.Row():
                     with gr.Column(scale=1):
-                        gr.Markdown("#### GOAL SETTING")
-                        # Added on feature/goal-setting-after-explore. Press
-                        # Enable after Stop Exploring to bring the patrol server
-                        # up on the completed map; it runs in the same robot
-                        # container and reuses the zenoh bridge that
-                        # Stop Exploring leaves running.
-                        with gr.Row():
-                            goal_enable_btn = gr.Button(
-                                "Enable Goal Setting", variant="primary",
-                                elem_classes=["goal-enable-btn"])
-                            goal_disable_btn = gr.Button(
-                                "Disable Goal Setting", variant="stop",
-                                elem_classes=["goal-disable-btn"])
-                        goal_status = gr.Textbox(
-                            label="Goal Setting Status", lines=2,
-                            interactive=False)
-
-                with gr.Row():
-                    with gr.Column(scale=1):
                         gr.Markdown("#### EXPLORER")
                         # The explanatory blurb was removed at the operator's
                         # request. The section is now just the heading, the two
@@ -2185,6 +2166,25 @@ def main():
                                 elem_classes=["explore-stop-btn"])
                         explore_status = gr.Textbox(
                             label="Explorer Status", lines=2, interactive=False)
+
+                # GOAL SETTING sits below EXPLORER because that is the order the
+                # operator works in: explore first, then enable goal setting on
+                # the map that exploration produced. Press Enable after Stop
+                # Exploring; it runs in the same robot container and reuses the
+                # zenoh bridge that Stop Exploring leaves running.
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### GOAL SETTING")
+                        with gr.Row():
+                            goal_enable_btn = gr.Button(
+                                "Enable Goal Setting", variant="primary",
+                                elem_classes=["goal-enable-btn"])
+                            goal_disable_btn = gr.Button(
+                                "Disable Goal Setting", variant="stop",
+                                elem_classes=["goal-disable-btn"])
+                        goal_status = gr.Textbox(
+                            label="Goal Setting Status", lines=2,
+                            interactive=False)
                     # The log used to sit in a scale=2 column beside these
                     # controls. It is now the last thing on the Mapping page (see
                     # the bottom of this tab), so the section is a single column.
