@@ -167,9 +167,13 @@
       const colour = known ? known.colour : '#ff9f43';
       const label = known ? known.text : state;
       const who = msg.explorer_robot ? ` (explorer: ${msg.explorer_robot})` : '';
+      // Only the coloured label. The raw enum token used to be appended in grey
+      // as well, which just repeated the word for the four known states --
+      // "Exploring EXPLORING". It is still the fallback text for an unrecognised
+      // state, where there is no friendly label to show instead.
       hud.mission.innerHTML =
         `<b style="color:${colour}">${label}</b>` +
-        `<span style="color:#6f7684; font-weight:400"> ${state}${who}</span>`;
+        (who ? `<span style="color:#6f7684; font-weight:400">${who}</span>` : '');
     }
 
     // --------------------------------------------------------------- scene
