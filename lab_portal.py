@@ -265,10 +265,10 @@ def _foxglove_status_html(note=None):
     except Exception:
         return (
             '<div style="padding:8px 10px;font-size:13px;color:#c8c8d0;">'
-            '3D viewer online.</div>'
+            '3D Viewer online.</div>'
         )
 
-    bits.append(f"viewer online · port {info.get('port', FOXGLOVE_PORT)}")
+    bits.append(f"Viewer online · port {info.get('port', FOXGLOVE_PORT)}")
     bits.append(f"{info.get('max_points_per_frame')} pts/frame @ "
                 f"{info.get('target_fps')} fps")
 
@@ -278,12 +278,12 @@ def _foxglove_status_html(note=None):
     if mm.get("modified_map_msgs"):
         age = mm.get("last_modified_map_age")
         age_s = f", {age:.0f}s ago" if age is not None else ""
-        bits.append(f"🗺 modified map {mm['modified_map_points']:,} pts"
+        bits.append(f"modified map {mm['modified_map_points']:,} pts"
                     f" on {mm.get('modified_map_topic')}{age_s}")
     elif mm.get("modified_map_topic"):
         # Names the topic so "nothing on it yet" is distinguishable from
         # "not wired up" -- identical from inside the 3D panel.
-        bits.append(f"🗺 modified map: none on {mm['modified_map_topic']}")
+        bits.append(f"modified map: none on {mm['modified_map_topic']}")
 
     robots = info.get("robots") or {}
     for ns, st in robots.items():
@@ -291,9 +291,9 @@ def _foxglove_status_html(note=None):
         age = st.get("last_cloud_age")
         if st.get("cloud_msgs", 0) > 0:
             fresh = f"{age:.1f}s ago" if age is not None else "just now"
-            cloud = f"☁ {st['buffered']:,} pts ({fresh})"
+            cloud = f"{st['buffered']:,} pts ({fresh})"
         else:
-            cloud = "☁ no cloud yet"
+            cloud = "no cloud yet"
         extra = []
         if st.get("pose_source"):
             extra.append(f"pose:{st['pose_source']}")
@@ -458,11 +458,15 @@ DASHBOARD_CSS = """
         padding:4px 12px !important;min-height:0 !important;height:auto !important;
         width:auto !important;border-radius:8px !important;}
 
-    /* Blocks / cards */
+    # Blocks / cards
     .gr-block,.gr-box,.gr-form{background:transparent !important;}
     .gr-group,.gr-gallery{background:var(--block-background-fill) !important;
         border:1px solid var(--block-border-color) !important;
         border-radius:12px !important;padding:12px !important;}
+
+    /* Foxglove status strip: sits under the iframe, so it needs its own gap
+       above rather than the default block spacing. */
+    .foxglove-status{margin-top:10px !important;}
 
     
 
@@ -2325,14 +2329,18 @@ def main():
                     interactive=True,
                     elem_classes=["foxglove-robot"],
                 )
-                foxglove_status = gr.Markdown(
-                    value=_foxglove_status_html("starting"),
-                )
                 foxglove_view = gr.HTML(
                     value='<iframe id="foxglove_frame" '
                           'src="http://localhost:8767/?robot=Luna" '
                           'style="width:100%; height:820px; border:0; '
                           'border-radius:8px; background:#0b0b12;"></iframe>'
+                )
+                # Declared after the iframe so the strip renders below the view.
+                # It describes what is inside the frame, which makes it read as a
+                # caption for the viewer rather than as part of the controls.
+                foxglove_status = gr.Markdown(
+                    value=_foxglove_status_html("starting"),
+                    elem_classes=["foxglove-status"],
                 )
 
                 def _on_foxglove_robot(name):
