@@ -2364,6 +2364,18 @@ def main():
                           'style="width:100%; height:820px; border:0; '
                           'border-radius:8px; background:#0b0b12;"></iframe>'
                 )
+                # The reciprocal hop, so "Switch to 3D" is not a one-way door.
+                # Between the view and the status strip: the strip is the last
+                # element on the page, so anchoring the button against its top
+                # edge keeps both visible without scrolling, even though the
+                # iframe alone is taller than a laptop viewport.
+                switch_to_2d_btn = gr.Button(
+                    "Switch to 2D", variant="secondary",
+                    elem_classes=["switch-view-btn"])
+                switch_to_2d_btn.click(
+                    _goto_tab("mapping"),
+                    inputs=None, outputs=page_tabs)
+
                 # Declared after the iframe so the strip renders below the view.
                 # It describes what is inside the frame, which makes it read as a
                 # caption for the viewer rather than as part of the controls.
@@ -2371,17 +2383,6 @@ def main():
                     value=_foxglove_status_html("starting"),
                     elem_classes=["foxglove-status"],
                 )
-
-                # The reciprocal hop, so "Switch to 3D" is not a one-way door.
-                # Sits directly above the status strip, which keeps it next to
-                # the other page-level control rather than under the tall iframe
-                # where it is far below the fold on a laptop screen.
-                switch_to_2d_btn = gr.Button(
-                    "Switch to 2D", variant="secondary",
-                    elem_classes=["switch-view-btn"])
-                switch_to_2d_btn.click(
-                    _goto_tab("mapping"),
-                    inputs=None, outputs=page_tabs)
 
                 def _on_foxglove_robot(name):
                     # Reload the iframe rather than rebuild it: the viewer owns
