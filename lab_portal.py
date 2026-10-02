@@ -2312,13 +2312,9 @@ def main():
             # just says so and every other tab is unaffected.
             # ================================================================
             with gr.Tab("Foxglove view", id="foxglove-ui"):
-                gr.Markdown("#### 3D LIDAR VIEW (FOXGLOVE-STYLE)")
-                gr.Markdown(
-                    "Live point cloud in the map frame, accumulated as the robot "
-                    "drives. Left-drag orbits, right-drag pans, wheel zooms — "
-                    "the same camera controls as Foxglove's 3D panel. The robot "
-                    "and its Nav2 path are shown alongside."
-                )
+                # The intro heading and blurb were removed at the operator's
+                # request. The tab label above is the only remaining label for
+                # this view.
                 foxglove_robot_dd = gr.Dropdown(
                     choices=list(ROBOTS.keys()),
                     value="Luna",
