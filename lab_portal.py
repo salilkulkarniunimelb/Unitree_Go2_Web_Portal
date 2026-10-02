@@ -493,6 +493,20 @@ DASHBOARD_CSS = """
        as a control that changes anything on the current page. */
     .switch-view-btn{margin-top:10px !important;font-weight:600 !important;}
 
+    /* Explorer buttons: colour the hover so the two actions read as
+       go/avoid at a glance. Pure CSS on :hover only -- no variant, label,
+       callback or enabled/disabled state is touched, so behaviour is
+       identical. Transparent-to-colour transitions rather than a colour
+       swap so the change is not jarring. */
+    .explore-start-btn{transition:background-color .15s ease,box-shadow .15s ease;}
+    .explore-start-btn:hover{background-color:#2e7d32 !important;
+        box-shadow:0 0 0 2px rgba(46,125,50,.45) !important;}
+    .explore-stop-btn{transition:background-color .15s ease,box-shadow .15s ease;}
+    .explore-stop-btn:hover{background-color:#c62828 !important;
+        box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
+    /* Keep the label legible once the background is a saturated colour. */
+    .explore-start-btn:hover *,.explore-stop-btn:hover *{color:#fff !important;}
+
     
 
     /* Tab navigation — style gradio tabs to look like nav buttons */
@@ -2139,9 +2153,11 @@ def main():
                         # buttons and the log, which is self-explanatory.
                         with gr.Row():
                             explore_start_btn = gr.Button(
-                                "Start Exploring", variant="primary")
+                                "Start Exploring", variant="primary",
+                                elem_classes=["explore-start-btn"])
                             explore_stop_btn = gr.Button(
-                                "Stop Exploring", variant="stop")
+                                "Stop Exploring", variant="stop",
+                                elem_classes=["explore-stop-btn"])
                         explore_status = gr.Textbox(
                             label="Explorer Status", lines=2, interactive=False)
                     # The log used to sit in a scale=2 column beside these
