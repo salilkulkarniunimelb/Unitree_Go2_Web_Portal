@@ -446,3 +446,107 @@ def _streaming_status(namespace, started_at, phase):
         head = f"⏳ Starting {label} ({mins:.0f}m elapsed)"
         tail = "reaching the server..."
     return f"{head} -- {tail}"
+
+
+# ===========================================================================
+# PATROL SERVER ("Goal Setting")
+# ===========================================================================
+# After exploration finishes, the operator presses Enable Goal Setting to bring
+# up the patrol server, which localises both robots on the completed map and
+# serves the patrol UI. It runs in the SAME container as the explorer and
+# reuses the zenoh bridge, because Stop Exploring leaves both of those alone --
+# it only signals the explorer's launch process group.
+#
+# The launch writes to its own pidfile/log (PATROL_* in explorer_host.sh), so
+# stopping exploration cannot disturb the patrol server and vice versa.
+
+# The host status probe for the patrol server is cached separately from the
+# explorer's, on the same rationale: the status tick runs every couple of
+# seconds and must not spawn an ssh process each time.
+_patrol_cache = {"at": 0.0, "running": False}
+
+
+def _invalidate_patrol():
+    _patrol_cache.update({"at": 0.0, "running": False})
+
+
+def _patrol_remote_status(max_age=_REMOTE_TTL_S):
+    """(running,) as the host sees it, rate-limited."""
+    now = time.time()
+    if now - _patrol_cache["at"] < max_age:
+        return _patrol_cache["running"]
+
+    rc, out = _ssh_call("patrol-status")
+    running = bool(rc == 0 and out.strip().startswith("running"))
+    _patrol_cache.update({"at": now, "running": running})
+    return running
+
+
+def patrol_start():
+    """Start the patrol server on the completed map. Returns (status, log)."""
+    with _lock:
+        rc, out = _ssh_call("patrol-start", timeout=STOP_TIMEOUT_S)
+        _invalidate_patrol()
+
+        log = _patrol_log()
+
+        if rc is None:
+            return (f"❌ Could not reach the server: {out}", log)
+        if rc != 0:
+            # The host prints PATROL_LAUNCH_FAILED plus the tail of the launch
+            # log when the launch dies immediately; surface that rather than a
+            # bare exit code, because the usual cause is a bad launch file.
+            if "PATROL_MAP_MISSING" in out:
+                return ("❌ The completed map was not found in the robot "
+                        "container, so nothing was started. See the log.", log)
+            if "PATROL_LAUNCH_FAILED" in out:
+                detail = "\n".join(out.strip().splitlines()[-12:])
+                return ("❌ The patrol launch exited immediately -- see the "
+                        f"log below.\n\n{detail}", log)
+            detail = out.strip().splitlines()[-1] if out.strip() else f"exit {rc}"
+            return (f"❌ Could not start the patrol server: {detail}", log)
+
+        return ("✅ Goal Setting enabled: the patrol server is bringing up "
+                "localisation on the completed map and the patrol UI. Give it "
+                "a few seconds, then set a goal.", log)
+
+
+def patrol_stop():
+    """Stop the patrol server. Leaves the zenoh bridge and container alone."""
+    with _lock:
+        rc, out = _ssh_call("patrol-stop", timeout=STOP_TIMEOUT_S)
+        _invalidate_patrol()
+
+        log = _patrol_log()
+
+        if rc is None:
+            return (f"❌ Could not reach the server to stop the patrol "
+                    f"server: {out}", log)
+        if rc != 0:
+            detail = out.strip().splitlines()[-1] if out.strip() else f"exit {rc}"
+            return (f"❌ Stop failed on the server: {detail}", log)
+
+        if "no patrol server" in out:
+            return ("ℹ️ Goal Setting was not running.", log)
+        return ("🛑 Goal Setting disabled. The patrol server has stopped; the "
+                "map and the robots are untouched.", log)
+
+
+def _patrol_log(max_bytes=LOG_TAIL_BYTES):
+    """Tail of the patrol launch log from the robot container."""
+    rc, out = _ssh_call("patrol-log", timeout=CALL_TIMEOUT_S)
+    if rc != 0 or not out.strip():
+        return "(no patrol log yet)"
+    tail = out
+    if len(tail) > max_bytes:
+        tail = tail[-max_bytes:]
+    return tail
+
+
+def patrol_status():
+    """Live state for the dashboard's status box. Returns (status, log)."""
+    log = _patrol_log()
+    if _patrol_remote_status():
+        return ("🟢 Goal Setting is enabled -- the patrol server is running on "
+                "the completed map.", log)
+    return ("⚪ Goal Setting is disabled.", log)

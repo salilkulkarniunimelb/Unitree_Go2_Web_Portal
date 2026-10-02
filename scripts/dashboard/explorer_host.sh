@@ -57,6 +57,13 @@ LAUNCH_PIDFILE=/workspace/.explorer_launch.pid
 # ros2 launch output is written here rather than streamed over SSH, so the
 # explorer keeps running if the portal or the SSH link goes away.
 LAUNCH_LOGFILE=/workspace/explorer_launch.log
+# Separate pid/log for the patrol server (Goal Setting). Deliberately NOT the
+# same file as the explorer's: stopping exploration must never take the patrol
+# server down, and sharing a pidfile would make the two kill each other.
+PATROL_PIDFILE=/workspace/.patrol_launch.pid
+PATROL_LOGFILE=/workspace/patrol_launch.log
+# The completed map the robots localise on after exploring.
+PATROL_MAP=/workspace/hardware_code/maps/amcl_completed_map.yaml
 
 PHASE="[explorer] PHASE="
 log()  { echo "[explorer] $*"; }
@@ -66,6 +73,7 @@ usage() {
     cat >&2 <<EOF
 explorer_host.sh: unsupported request.
   start <luna|astro> | stop | status
+  patrol-start | patrol-stop | patrol-status | patrol-log
 EOF
     exit 2
 }
@@ -97,6 +105,10 @@ case "$ACTION" in
         esac
         ;;
     stop|status|log) ;;
+    # Patrol server (Goal Setting). No robot argument: it brings up
+    # localisation + the patrol UI for BOTH robots from the shared completed
+    # map, so there is nothing to select here.
+    patrol-start|patrol-stop|patrol-status|patrol-log) ;;
     *) usage ;;
 esac
 
@@ -118,6 +130,19 @@ launch_pid() {
 launch_alive() {
     local pid
     pid="$(launch_pid 2>/dev/null)" || return 1
+    [ -n "$pid" ] || return 1
+    docker exec "$CONTAINER" kill -0 "$pid" 2>/dev/null
+}
+
+# Same pair of helpers for the patrol server, against its own pidfile.
+patrol_launch_pid() {
+    container_running || return 1
+    docker exec "$CONTAINER" cat "$PATROL_PIDFILE" 2>/dev/null
+}
+
+patrol_alive() {
+    local pid
+    pid="$(patrol_launch_pid 2>/dev/null)" || return 1
     [ -n "$pid" ] || return 1
     docker exec "$CONTAINER" kill -0 "$pid" 2>/dev/null
 }
@@ -242,9 +267,96 @@ do_log() {
         || echo "(no launch log yet)"
 }
 
+do_patrol_start() {
+    # Idempotent-ish: refuse rather than stack a second launch, because two
+    # would fight over /map and the AMCL filter.
+    if patrol_alive; then
+        log "the patrol server is already running in $CONTAINER"
+        return 1
+    fi
+
+    # The zenoh bridge and the container are deliberately left alone: the
+    # operator presses this after Stop Exploring, and neither of those is
+    # stopped by Stop Exploring. Only the launch itself is (re)started here.
+    if ! container_running; then
+        log "container $CONTAINER is not running - starting it"
+        docker start "$CONTAINER" >/dev/null || fail "could not start $CONTAINER"
+        sleep 5
+    fi
+    container_running || fail "$CONTAINER is not running after start"
+
+    docker exec "$CONTAINER" bash -c '
+        cd '"$WS"' || exit 1
+        source /opt/ros/humble/setup.bash
+        [ -f install/setup.bash ] && source install/setup.bash
+
+        if [ ! -f '"$PATROL_MAP"' ]; then
+            echo "PATROL_MAP_MISSING"
+            exit 2
+        fi
+
+        # Detached with setsid for the same reason as the explorer: stop has to
+        # be able to signal the whole process group.
+        setsid ros2 launch orchestrator hivemind_patrol_server.launch.py \
+            map_yaml:='"$PATROL_MAP"' \
+            > '"$PATROL_LOGFILE"' 2>&1 < /dev/null &
+        echo $! > '"$PATROL_PIDFILE"'
+        # A bad launch file exits within a second or so; surface that as a real
+        # error rather than the dashboard claiming success.
+        sleep 5
+        if kill -0 "$(cat '"$PATROL_PIDFILE"')" 2>/dev/null; then
+            echo "PATROL_LAUNCHED"
+        else
+            echo "PATROL_LAUNCH_FAILED"
+            tail -n 20 '"$PATROL_LOGFILE"' 2>/dev/null
+            exit 1
+        fi
+    '
+}
+
+do_patrol_stop() {
+    local pid
+    pid="$(patrol_launch_pid 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+        log "no patrol server is running in $CONTAINER"
+        return 0
+    fi
+
+    log "stopping patrol server (pid $pid) in $CONTAINER"
+    docker exec "$CONTAINER" bash -c "kill -TERM -$pid 2>/dev/null" || true
+    for _ in $(seq 1 20); do
+        docker exec "$CONTAINER" kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if docker exec "$CONTAINER" kill -0 "$pid" 2>/dev/null; then
+        log "still alive after SIGTERM - sending SIGKILL"
+        docker exec "$CONTAINER" bash -c "kill -KILL -$pid 2>/dev/null" || true
+    fi
+    docker exec "$CONTAINER" rm -f "$PATROL_PIDFILE" 2>/dev/null || true
+    log "patrol server stopped"
+}
+
+do_patrol_status() {
+    if patrol_alive; then
+        echo "running pid=$(patrol_launch_pid)"
+    else
+        echo "stopped"
+    fi
+}
+
+do_patrol_log() {
+    container_running || { echo "(container $CONTAINER is not running)"; return 0; }
+    docker exec "$CONTAINER" tail -c 8000 "$PATROL_LOGFILE" 2>/dev/null \
+        || echo "(no patrol log yet)"
+}
+
 case "$ACTION" in
     start)  do_start ;;
     stop)   do_stop ;;
     status) do_status ;;
     log)    do_log ;;
+    patrol-start)  do_patrol_start ;;
+    patrol-stop)   do_patrol_stop ;;
+    patrol-status) do_patrol_status ;;
+    patrol-log)    do_patrol_log ;;
 esac

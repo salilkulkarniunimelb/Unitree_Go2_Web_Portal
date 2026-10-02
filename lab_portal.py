@@ -506,6 +506,12 @@ DASHBOARD_CSS = """
         box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
     /* Keep the label legible once the background is a saturated colour. */
     .explore-start-btn:hover *,.explore-stop-btn:hover *{color:#fff !important;}
+    .goal-enable-btn,.goal-disable-btn{transition:background-color .15s ease,box-shadow .15s ease;}
+    .goal-enable-btn:hover{background-color:#1565c0 !important;
+        box-shadow:0 0 0 2px rgba(21,101,192,.45) !important;}
+    .goal-disable-btn:hover{background-color:#c62828 !important;
+        box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
+    .goal-enable-btn:hover *,.goal-disable-btn:hover *{color:#fff !important;}
 
     
 
@@ -2147,6 +2153,25 @@ def main():
                 # ================================================================
                 with gr.Row():
                     with gr.Column(scale=1):
+                        gr.Markdown("#### GOAL SETTING")
+                        # Added on feature/goal-setting-after-explore. Press
+                        # Enable after Stop Exploring to bring the patrol server
+                        # up on the completed map; it runs in the same robot
+                        # container and reuses the zenoh bridge that
+                        # Stop Exploring leaves running.
+                        with gr.Row():
+                            goal_enable_btn = gr.Button(
+                                "Enable Goal Setting", variant="primary",
+                                elem_classes=["goal-enable-btn"])
+                            goal_disable_btn = gr.Button(
+                                "Disable Goal Setting", variant="stop",
+                                elem_classes=["goal-disable-btn"])
+                        goal_status = gr.Textbox(
+                            label="Goal Setting Status", lines=2,
+                            interactive=False)
+
+                with gr.Row():
+                    with gr.Column(scale=1):
                         gr.Markdown("#### EXPLORER")
                         # The explanatory blurb was removed at the operator's
                         # request. The section is now just the heading, the two
@@ -2321,6 +2346,15 @@ def main():
                     show_label=False, lines=12, max_lines=12,
                     interactive=False)
 
+                # ---------- BOTTOM: GOAL SETTING LOG ----------
+                # Shares the log textbox with the explorer buttons above, for
+                # the same reason they are declared together: the callbacks
+                # close over goal_log, so it must exist before they are wired.
+                gr.Markdown("#### GOAL SETTING LOG")
+                goal_log = gr.Textbox(
+                    show_label=False, lines=8, max_lines=8,
+                    interactive=False)
+
                 # api_name exposes these as Gradio API endpoints
                 # (POST /gradio_api/call/start_exploring with {"data": ["Luna"]}),
                 # matching the drag_initial endpoint above, so the explorer can
@@ -2337,6 +2371,36 @@ def main():
                 explore_timer.tick(on_explorer_tick,
                                    outputs=[explore_status, explore_log],
                                    api_name="explorer_status")
+
+                def on_goal_enable():
+                    if explorer_control is None:
+                        return ("❌ explorer_control is not available, so Goal "
+                                "Setting cannot be enabled.")
+                    return explorer_control.patrol_start()
+
+                def on_goal_disable():
+                    if explorer_control is None:
+                        return ("❌ explorer_control is not available, so Goal "
+                                "Setting cannot be disabled.")
+                    return explorer_control.patrol_stop()
+
+                def on_goal_tick():
+                    if explorer_control is None:
+                        return ("⚪ Goal Setting is unavailable.")
+                    return explorer_control.patrol_status()
+
+                goal_enable_btn.click(
+                    on_goal_enable, inputs=None,
+                    outputs=[goal_status, goal_log],
+                    api_name="enable_goal_setting")
+                goal_disable_btn.click(
+                    on_goal_disable, inputs=None,
+                    outputs=[goal_status, goal_log],
+                    api_name="disable_goal_setting")
+                goal_timer = gr.Timer(2.0)
+                goal_timer.tick(on_goal_tick,
+                                outputs=[goal_status, goal_log],
+                                api_name="goal_setting_status")
 
             # ================================================================
             # TAB 2: FLEET VIEW (both robots on one map)
