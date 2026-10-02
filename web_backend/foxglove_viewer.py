@@ -19,6 +19,7 @@ What it renders, and why it is not just a point-cloud dump:
   * /<robot>/go2/restamped/robot_odom  odom-frame pose (10x the rate)
   * /<robot>/tf_static                 base_link -> <robot>/utlidar_lidar
   * /<robot>/lidar_slam_2d_map         occupancy grid, drawn as the floor
+  * /<robot>/modified_map               lidar_slam's graph-optimised map cloud
   * /<robot>/plan                       Nav2 path
 
 The lidar publishes in its own frame (<robot>/utlidar_lidar), so a raw feed
@@ -49,6 +50,7 @@ Environment:
     FOXGLOVE_WINDOW_SECS  seconds of scans kept in the buffer (default 2.0)
     FOXGLOVE_ACCUM_MAX    hard point cap for the buffer       (default 2000000)
     FOXGLOVE_CLOUD_TOPIC  point-cloud topic to view           (default /go2/accumulated/cloud_base)
+    FOXGLOVE_MODIFIED_MAP_MAX  cap on the /modified_map layer (default 400000)
 """
 
 import asyncio
@@ -94,6 +96,9 @@ WINDOW_SECS = _env_float("FOXGLOVE_WINDOW_SECS", 2.0)
 # Hard memory guard for the rolling buffer; only reached if the window is set
 # extremely large.
 ACCUM_MAX_POINTS = _env_int("FOXGLOVE_ACCUM_MAX", 2_000_000)
+# The modified map is a whole optimised map, not a rolling window of scans, so
+# it is sampled once to this budget and then held until SLAM republishes it.
+MODIFIED_MAP_MAX_POINTS = _env_int("FOXGLOVE_MODIFIED_MAP_MAX", 400000)
 
 # Shared by the page, the portal iframe and the handshake interceptor below, so
 # the socket path exists in exactly one place.
@@ -131,8 +136,56 @@ PLAN_TOPIC = "/{ns}/plan"
 # the occupancy grid by a fixed translation + yaw.
 MAP_ODOM_CORRECTION_TOPIC = "/{ns}/go2/split_compute/map_odom_correction"
 
+# lidar_slam's graph-optimised map: what the real Foxglove app shows as a dense,
+# static cloud that stays put while the dog drives. Published by
+# graph_based_slam as a sensor_msgs/PointCloud2 (NOT a nav_msgs/OccupancyGrid)
+# already stamped in the "map" frame, so unlike the live cloud it needs no
+# transform into the map frame -- only the ROS->three.js axis swap. It is the
+# pose-graph output of /map_array, i.e. the same geometry the 2D grid is
+# projected from, so it registers with the floor instead of needing to be
+# aligned to it.
+#
+# GLOBAL, not per-robot, and deliberately so: graph_based_slam_node is not
+# namespaced and the explorer launch remaps only /modified_map_array, leaving
+# this one as /modified_map. Verified on the robot --
+# `ros2 topic info /modified_map -v` shows publisher graph_based_slam and
+# subscriber foxglove_bridge. There is no /luna/modified_map or
+# /astro/modified_map publisher, so a "/{ns}/modified_map" guess subscribes to
+# nothing at all.
+#
+# It fires on every pose-graph optimisation (seconds apart while loop closures
+# are being accepted, much longer when the dog is only driving) and is
+# RELIABLE/VOLATILE, so a late-joining viewer waits for the next optimisation
+# rather than being handed a latched copy.
+MODIFIED_MAP_TOPIC = os.environ.get(
+    "FOXGLOVE_MODIFIED_MAP_TOPIC", "/modified_map").strip() or "/modified_map"
+
+
+def modified_map_topic(ns):
+    return MODIFIED_MAP_TOPIC.format(ns=ns)
+
 MSG_CLOUD = 1
 MSG_PATH = 2
+MSG_MAP_CLOUD = 3
+
+# The Hivemind mission manager's own state, which is what RViz was displaying as
+# "Exploring". It publishes a JSON string at ~5 Hz on a single global topic from
+# a single publisher (node `hivemind_mission_manager`) --
+#
+#   {"completion_status": "Complete", "explorer_robot": "luna",
+#    "mission_state": "MAP_COMPLETE", "selected_namespace": "/luna"}
+#
+# Subscribed purely to be displayed. Nothing here publishes, commands or
+# otherwise influences the mission -- this is a read-only mirror of a topic the
+# operator UI already surfaces.
+MISSION_TOPIC = os.environ.get(
+    "FOXGLOVE_MISSION_TOPIC", "/hivemind/mission_state"
+).strip() or "/hivemind/mission_state"
+
+# The full enum from go2_hardware_autonomy.hivemind_mission.MissionState.
+# Unknown values are passed through rather than dropped, so a state added
+# upstream shows up instead of silently reading as "idle".
+MISSION_STATES = ("IDLE", "EXPLORING", "MAP_COMPLETE", "READY_FOR_PATROL")
 
 # Wire header: u8 type, u8 flags, u16 reserved, u32 count, f32 x, y, z, yaw.
 # Defined once and reused by both frame encoders so the two can never disagree
@@ -207,7 +260,37 @@ _PC_DTYPES = {
 _PC_INTEGER = {1, 2, 3, 4, 5, 6}
 
 
-def decode_point_cloud(msg):
+def _apply_colormap(t, colormap):
+    """Map normalised intensity t in [0,1] onto 0-255 RGB.
+
+    Neither of these is real colour -- see decode_point_cloud's docstring. They
+    only differ in how the single intensity scalar is stretched across the RGB
+    cube, and "jet" exists so the map matches what the Foxglove app draws.
+    """
+    if colormap == "jet":
+        # Piecewise-linear jet: dark blue -> blue -> cyan -> green -> yellow ->
+        # orange -> dark red. Written as clamped triangles around the 0.25 /
+        # 0.5 / 0.75 stops, which is cheaper than a lookup table and smooth
+        # enough at these point sizes.
+        rgb = np.empty((t.shape[0], 3), dtype=np.uint8)
+        rgb[:, 0] = (np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0) * 255.0
+                     ).astype(np.uint8)
+        rgb[:, 1] = (np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0) * 255.0
+                     ).astype(np.uint8)
+        rgb[:, 2] = (np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0) * 255.0
+                     ).astype(np.uint8)
+        return rgb
+
+    # "warm": blue (weak return) -> yellow (strong), reads well on a dark scene
+    # and keeps the live cloud's established look.
+    rgb = np.empty((t.shape[0], 3), dtype=np.uint8)
+    rgb[:, 0] = (t * 255.0).astype(np.uint8)
+    rgb[:, 1] = (t * 210.0).astype(np.uint8)
+    rgb[:, 2] = ((1.0 - t) * 255.0).astype(np.uint8)
+    return rgb
+
+
+def decode_point_cloud(msg, colormap="warm"):
     """PointCloud2 -> (Nx3 float32 xyz, Nx3 uint8 rgb), or None.
 
     Not pc2.read_points: that builds a Python tuple per point and cannot keep up
@@ -217,6 +300,15 @@ def decode_point_cloud(msg):
     The Go2's cloud_base is float32 x/y/z with a float32 intensity and a uint16
     ring index. Other drivers publish the same fields as uint16 millimetres, so
     integer x/y/z are scaled by 1e-3 rather than trusted as metres.
+
+    ``colormap`` picks how intensity becomes colour, and it matters because the
+    hardware has no RGB to preserve: both clouds carry xyz+intensity only, and
+    lidar_slam's modified map is PointXYZI by construction, so every colour on
+    screen is a function of intensity. "warm" is the default live-cloud look
+    (blue->yellow); "jet" is the classic blue->cyan->green->yellow->red ramp
+    that Foxglove's own intensity colouring approximates, so a map rendered with
+    it reads like the Foxglove app. There is deliberately no "rgb" mode: no
+    publisher on this robot carries an rgb field to read.
     """
     data = msg.data
     if data is None or len(data) == 0:
@@ -282,11 +374,7 @@ def decode_point_cloud(msg):
         if peak <= 0:
             continue
         t = np.clip(np.abs(vals) / peak, 0.0, 1.0)
-        # Blue (weak return) -> yellow (strong), which reads well on a dark scene.
-        rgb = np.empty((t.shape[0], 3), dtype=np.uint8)
-        rgb[:, 0] = (t * 255.0).astype(np.uint8)
-        rgb[:, 1] = (t * 210.0).astype(np.uint8)
-        rgb[:, 2] = ((1.0 - t) * 255.0).astype(np.uint8)
+        rgb = _apply_colormap(t, colormap)
         break
 
     if rgb is None:
@@ -382,13 +470,187 @@ class MapFrameBuffer:
         return xyz[::step], rgb[::step]
 
 
+class ModifiedMapLayer:
+    """The graph-optimised map, owned once for the whole bridge.
+
+    graph_based_slam_node is a single un-namespaced node publishing one
+    /modified_map, so it describes the same world for both dogs. One
+    subscription and one copy therefore beat one per robot, which would decode
+    a multi-megabyte cloud twice and hold it twice in memory for no gain.
+
+    Separate from RobotState on purpose: everything in RobotState is placed
+    through a robot pose, and this layer must not be -- it is already in the map
+    frame, so feeding it through map_from_lidar() would translate and rotate the
+    entire map every time the dog moved a centimetre.
+    """
+
+    def __init__(self, node):
+        self.topic = MODIFIED_MAP_TOPIC
+        self.xyz = None
+        self.rgb = None
+        self.seq = 0
+        self.msgs = 0
+        self.undecodable = 0
+        self.last_wall = 0.0
+        self.last_error = None
+        self._subscribe(node)
+
+    def _subscribe(self, node):
+        from sensor_msgs.msg import PointCloud2
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+        # Upstream is RELIABLE/VOLATILE (rclcpp::QoS(10)), so the volatile
+        # subscription is the one that actually matches today. The latched one
+        # costs nothing and covers a future relay that republishes this as
+        # TRANSIENT_LOCAL, which is how /lidar_slam_2d_map is served.
+        volatile = QoSProfile(depth=1)
+        latched = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        node.create_subscription(PointCloud2, self.topic, self._on_map, volatile)
+        node.create_subscription(PointCloud2, self.topic, self._on_map, latched)
+
+    def _on_map(self, msg):
+        """One pose-graph optimisation result, drawn as-is.
+
+        Replace rather than accumulate: each message is the complete optimised
+        map, so merging successive ones would only smear the previous
+        optimisation's geometry over the current one.
+        """
+        try:
+            # "jet" so the map reads like the Foxglove app. It has no RGB to
+            # preserve either -- PointXYZI -- so this is intensity through a
+            # colormap, exactly as Foxglove does it.
+            decoded = decode_point_cloud(msg, colormap="jet")
+            if decoded is None:
+                self.undecodable += 1
+                return
+            xyz, rgb = decoded
+
+            # Z-up -> Y-up only. No translation, no rotation: the publisher
+            # already stamped this in "map".
+            out = np.empty_like(xyz)
+            out[:, 0] = xyz[:, 0]
+            out[:, 1] = xyz[:, 2]
+            out[:, 2] = -xyz[:, 1]
+
+            total = out.shape[0]
+            if total > MODIFIED_MAP_MAX_POINTS:
+                step = int(math.ceil(total / MODIFIED_MAP_MAX_POINTS))
+                out, rgb = out[::step], rgb[::step]
+
+            self.xyz = out
+            self.rgb = rgb
+            self.msgs += 1
+            self.seq += 1
+            self.last_wall = time.time()
+        except Exception as exc:  # noqa: BLE001 - one bad map must not kill the node
+            self.last_error = repr(exc)
+
+    def health(self):
+        return {
+            "modified_map_topic": self.topic,
+            "modified_map_msgs": self.msgs,
+            "modified_map_points": 0 if self.xyz is None
+                                  else int(self.xyz.shape[0]),
+            # Null while nothing has ever arrived, so "never seen" stays
+            # distinguishable from "seen long ago".
+            "last_modified_map_age": (
+                None if not self.last_wall
+                else round(time.time() - self.last_wall, 2)),
+            "modified_map_undecodable": self.undecodable,
+            "modified_map_error": self.last_error,
+        }
+
+
+# ===========================================================================
+# Hivemind mission state (read-only status mirror)
+# ===========================================================================
+class MissionStateView:
+    """Mirrors the mission manager's state so the viewer can show it.
+
+    Display only. The viewer has no publisher on any mission topic and no
+    service client; it never sends a goal or a cancel. That is deliberate --
+    an operator-facing status readout should not be able to steer the robot.
+
+    The payload is a std_msgs/String holding JSON. It is parsed rather than
+    pattern-matched so that fields added upstream (completion_status,
+    selected_namespace) show up without a code change here.
+    """
+
+    def __init__(self, node):
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+        from std_msgs.msg import String
+
+        self.topic = MISSION_TOPIC
+        self.state = None
+        self.explorer_robot = None
+        self.selected_namespace = None
+        self.completion_status = None
+        self.msgs = 0
+        self.last_wall = None
+        self.last_error = None
+
+        # Reliable plus TRANSIENT_LOCAL as well as volatile: the publisher is
+        # only ~5 Hz but is otherwise well behaved, and a latched copy means a
+        # viewer opened mid-mission shows the current state immediately rather
+        # than "unknown" until the next tick.
+        volatile = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
+        latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        node.create_subscription(String, self.topic, self._on_state, volatile)
+        node.create_subscription(String, self.topic, self._on_state, latched)
+
+    def _on_state(self, msg):
+        try:
+            data = json.loads(msg.data)
+            state = str(data.get("mission_state") or "").strip().upper()
+            if not state:
+                raise ValueError("no mission_state in payload")
+            # Not validated against MISSION_STATES on purpose: an unrecognised
+            # state is news, and hiding it would look identical to "idle".
+            self.state = state
+            self.explorer_robot = data.get("explorer_robot")
+            self.selected_namespace = data.get("selected_namespace")
+            self.completion_status = data.get("completion_status")
+            self.msgs += 1
+            self.last_wall = time.time()
+            self.last_error = None
+        except Exception as exc:  # noqa: BLE001 - a bad payload must not kill the node
+            self.last_error = repr(exc)
+
+    def snapshot(self):
+        """(key, payload) for change-gating the websocket push."""
+        return (self.state, self.explorer_robot, self.completion_status)
+
+    def health(self):
+        return {
+            "mission_topic": self.topic,
+            "mission_state": self.state,
+            "mission_known_states": list(MISSION_STATES),
+            "explorer_robot": self.explorer_robot,
+            "selected_namespace": self.selected_namespace,
+            "completion_status": self.completion_status,
+            "mission_msgs": self.msgs,
+            # Null until the first message, so "never heard from it" stays
+            # distinguishable from "stale".
+            "last_mission_age": (None if not self.last_wall
+                                 else round(time.time() - self.last_wall, 2)),
+            "mission_error": self.last_error,
+        }
+
+
 # ===========================================================================
 # Per-robot state
 # ===========================================================================
 class RobotState:
-    def __init__(self, ns, node):
+    def __init__(self, ns, node, modmap=None):
         self.ns = ns
         self.label = ROBOT_LABELS[ns]
+        # Shared across robots (see ModifiedMapLayer); may be None in tests.
+        self.modmap = modmap
 
         self.buffer = MapFrameBuffer(WINDOW_SECS, ACCUM_MAX_POINTS)
         self.map_png = None
@@ -421,7 +683,13 @@ class RobotState:
 
         self.cloud_msgs = 0
         self.last_cloud_wall = 0.0
+        # Points discarded because no pose was available to place them. A
+        # cumulative counter is useless here: a robot that never gets a pose
+        # (astro, right now) increments it on every cloud forever, and it was
+        # reporting tens of millions. The streak start lets health() publish a
+        # rate instead, which stays readable however long the outage lasts.
         self.dropped_no_pose = 0
+        self._drop_streak_start = None
         self.last_error = None
 
         self._subscribe(node)
@@ -497,6 +765,9 @@ class RobotState:
 
             tf = self.map_from_lidar()
             if tf is None:
+                # Discarded, not buffered: there is nowhere to put them.
+                if self._drop_streak_start is None:
+                    self._drop_streak_start = time.time()
                 self.dropped_no_pose += int(xyz.shape[0])
                 return
 
@@ -518,6 +789,7 @@ class RobotState:
             self.last_cloud_wall = time.time()
             if self.dropped_no_pose:
                 self.dropped_no_pose = 0
+                self._drop_streak_start = None
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the node
             self.last_error = repr(exc)
 
@@ -685,8 +957,25 @@ class RobotState:
                            pose.get("z", 0.0)) @ self.base_from_lidar
 
     # ------------------------------------------------------------- snapshot
+    def dropped_no_pose_rate(self):
+        """Points/s being discarded right now, or None when nothing is dropped.
+
+        Averaged over the current no-pose streak. Reported alongside the raw
+        counter because the counter alone is unreadable: for a robot that never
+        gets a pose it just grows forever (astro reached ~39M).
+        """
+        if not self.dropped_no_pose or self._drop_streak_start is None:
+            return None
+        elapsed = time.time() - self._drop_streak_start
+        if elapsed <= 0:
+            return None
+        return int(self.dropped_no_pose / elapsed)
+
     def snapshot(self, budget):
         xyz, rgb = self.buffer.sample(budget)
+        # The graph-optimised map is shared, not per-robot; an absent layer
+        # (unit tests) behaves as "not published yet".
+        mm = self.modmap
         return {
             "xyz": xyz,
             "rgb": rgb,
@@ -696,10 +985,14 @@ class RobotState:
             "map_seq": self.map_seq,
             "plan": self.plan,
             "plan_stamp": self.plan_stamp,
+            "modmap_xyz": mm.xyz,
+            "modmap_rgb": mm.rgb,
+            "modmap_seq": mm.seq,
 "stats": {
                 "cloud_msgs": self.cloud_msgs,
                 "buffered": len(self.buffer),
                 "dropped_no_pose": self.dropped_no_pose,
+                "dropped_no_pose_rate": self.dropped_no_pose_rate(),
                 "last_cloud_age": None if not self.last_cloud_wall
                                   else time.time() - self.last_cloud_wall,
             },
@@ -714,6 +1007,7 @@ class RobotState:
             "window_secs": round(self.buffer.window_secs, 2),
             "window_span_secs": round(self.buffer.span_secs, 2),
             "dropped_no_pose": self.dropped_no_pose,
+            "dropped_no_pose_rate": self.dropped_no_pose_rate(),
             "last_cloud_age": None if not self.last_cloud_wall
                               else round(time.time() - self.last_cloud_wall, 2),
             "has_pose": self.map_pose() is not None,
@@ -726,6 +1020,7 @@ class RobotState:
             "has_map": self.map_png is not None,
             "plan_points": len(self.plan),
             "last_error": self.last_error,
+            **(self.modmap.health() if self.modmap is not None else {}),
         }
 
 
@@ -735,6 +1030,8 @@ class RobotState:
 class Bridge:
     def __init__(self):
         self.robots = {}
+        self.modmap = None
+        self.mission = None
         self.error = None
         self.ready = threading.Event()
         self._node = None
@@ -765,12 +1062,27 @@ class Bridge:
             _log(f"rclpy.init reported: {exc!r}")
 
         node = Node("foxglove_viewer_node")
+        # One shared graph-optimised map for both robots, subscribed before the
+        # per-robot states so those can be handed a reference to it.
+        try:
+            self.modmap = ModifiedMapLayer(node)
+            _log(f"subscribed to {self.modmap.topic} "
+                 "(graph-optimised map, shared by all robots)")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"modified_map subscription setup failed: {exc!r}")
         for ns in ROBOT_NAMESPACES:
             try:
-                self.robots[ns] = RobotState(ns, node)
+                self.robots[ns] = RobotState(ns, node, self.modmap)
                 _log(f"[{ns}] subscribed to {cloud_topic(ns)}")
             except Exception as exc:  # noqa: BLE001
                 _log(f"[{ns}] subscription setup failed: {exc!r}")
+        # Status only. Wrapped separately so a missing mission_manager on some
+        # deployment degrades to "unknown" instead of taking the data path down.
+        try:
+            self.mission = MissionStateView(node)
+            _log(f"subscribed to {self.mission.topic} (mission status, read-only)")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"mission_state subscription setup failed: {exc!r}")
         self._node = node
 
         ex = MultiThreadedExecutor(num_threads=4)
@@ -827,6 +1139,13 @@ class Bridge:
             "accum_max": ACCUM_MAX_POINTS,
             "target_fps": TARGET_FPS,
             "spin_cycles": self._spin_cycles,
+            # Global (one publisher, one map) so it is reported once at the top
+            # level rather than repeated under every robot.
+            "modified_map": (self.modmap.health()
+                             if self.modmap is not None else None),
+            # Global too: one mission manager for the whole fleet.
+            "mission": (self.mission.health()
+                        if self.mission is not None else None),
             "robots": {ns: st.health() for ns, st in self.robots.items()},
         }
 
@@ -865,6 +1184,22 @@ def encode_path_frame(plan):
         arr[i, 1] = 0.05
         arr[i, 2] = -y
     return struct.pack(_HEADER_FMT, MSG_PATH, 0, 0, n, 0, 0, 0, 0) + arr.tobytes()
+
+
+def encode_map_cloud_frame(xyz, rgb):
+    """The static modified-map layer, same layout as the cloud frame.
+
+    Reuses the cloud's header and interleaved layout rather than inventing a
+    second shape, so the browser decodes both with one code path. The pose
+    fields stay zero and flag bit0 is clear: this layer is fixed in the map
+    frame and has no robot of its own, and leaving the pose out stops the
+    viewer from mistaking it for a fresh robot reading.
+    """
+    if xyz is None or xyz.shape[0] == 0:
+        return None
+    n = int(xyz.shape[0])
+    header = struct.pack(_HEADER_FMT, MSG_MAP_CLOUD, 0, 0, n, 0, 0, 0, 0)
+    return header + xyz.astype("<f4", copy=False).tobytes() + rgb.tobytes()
 
 
 # ===========================================================================
@@ -964,11 +1299,15 @@ async def client_handler(ws, bridge):
     interval = 1.0 / max(0.5, TARGET_FPS)
     stop = asyncio.Event()
     sent_map_seq = {}
+    sent_modmap_seq = {}
     sent_plan_stamp = {}
 
     async def pump():
         nonlocal ns
         announced = None
+        # None means "nothing sent yet", so the first real state is always
+        # pushed even if it happens to be the first key we see.
+        sent_mission = None
         while not stop.is_set():
             t0 = time.time()
             try:
@@ -995,12 +1334,46 @@ async def client_handler(ws, bridge):
                                               "png": snap["map_png"],
                                               **snap["map_meta"]}))
 
+                # The graph-optimised map only changes when SLAM re-optimises,
+                # and it is hundreds of thousands of points, so gate it on the
+                # sequence number -- once per connection, then only on a
+                # genuine re-optimisation.
+                if snap["modmap_xyz"] is not None \
+                        and sent_modmap_seq.get(ns) != snap["modmap_seq"]:
+                    sent_modmap_seq[ns] = snap["modmap_seq"]
+                    frame = encode_map_cloud_frame(snap["modmap_xyz"],
+                                                   snap["modmap_rgb"])
+                    if frame:
+                        await ws.send(frame)
+
                 # The plan only changes when Nav2 replans, so gate on its stamp.
                 if snap["plan"] and sent_plan_stamp.get(ns) != snap["plan_stamp"]:
                     sent_plan_stamp[ns] = snap["plan_stamp"]
                     frame = encode_path_frame(snap["plan"])
                     if frame:
                         await ws.send(frame)
+
+                # Mission state republishes at ~5 Hz whether or not it moved. Gate on the
+                # value so the socket carries one small JSON frame per actual
+                # transition instead of one per tick.
+                #
+                # bridge.mission is read here, per iteration, rather than captured
+                # into a local when this closure is built. make_process_request runs
+                # once at websockets.serve() time, which is before bridge.start() has
+                # finished its thread -- capturing it then would latch None forever
+                # and the status would silently never appear.
+                mission = bridge.mission
+                if mission is not None:
+                    key = mission.snapshot()
+                    if key[0] is not None and key != sent_mission:
+                        sent_mission = key
+                        await ws.send(json.dumps({
+                            "type": "mission",
+                            "state": key[0],
+                            "explorer_robot": mission.explorer_robot,
+                            "completion_status": mission.completion_status,
+                            "known_states": list(MISSION_STATES),
+                        }))
 
                 # Say something rather than going quiet, so the HUD can tell
                 # "no data yet" apart from "connection frozen".
@@ -1027,7 +1400,8 @@ async def client_handler(ws, bridge):
         await ws.send(json.dumps({"type": "status",
                                   "message": "connected"}))
         await ws.send(json.dumps({"type": "topic",
-                                  "topic": cloud_topic(ns)}))
+                                  "topic": cloud_topic(ns),
+                                  "modmap_topic": modified_map_topic(ns)}))
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -1040,7 +1414,8 @@ async def client_handler(ws, bridge):
                 ns = wanted
                 _log(f"client subscribed to {ns}")
                 await ws.send(json.dumps({"type": "topic",
-                                          "topic": cloud_topic(ns)}))
+                                          "topic": cloud_topic(ns),
+                                          "modmap_topic": modified_map_topic(ns)}))
             elif wanted:
                 await ws.send(json.dumps({
                     "type": "error",

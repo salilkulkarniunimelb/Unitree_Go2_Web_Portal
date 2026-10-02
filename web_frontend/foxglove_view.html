@@ -82,6 +82,8 @@
     <div><b>Robot</b> <span class="val" id="hud-robot">Luna</span> &nbsp;|&nbsp; <b>Frame</b> <span class="val">map</span></div>
     <div><b>Topic</b> <span class="val" id="hud-topic">(resolving&hellip;)</span></div>
     <div><b>Points</b> <span class="val" id="hud-points">0</span> &nbsp;|&nbsp; <b>Render</b> <span class="val" id="hud-fps">0 fps</span> &nbsp;|&nbsp; <b>Stream</b> <span class="val" id="hud-stream">0 fps</span></div>
+    <div><b>Mission</b> <span class="val" id="hud-mission">connecting to /hivemind/mission_state&hellip;</span></div>
+    <div><b>Modified map</b> <span class="val" id="hud-modmap">waiting for /modified_map&hellip; (only publishes on pose-graph optimisation)</span></div>
     <div><b>Robot pose</b> <span class="val" id="hud-pose">x &ndash; y &ndash; yaw &ndash;</span></div>
     <div><b>Status</b> <span id="status-waiting">connecting&hellip;</span></div>
   </div>
@@ -89,7 +91,8 @@
   <div id="err-detail"></div>
   <div id="help">
     Left-drag orbit &nbsp;·&nbsp; Right-drag pan &nbsp;·&nbsp; Wheel zoom &nbsp;·&nbsp;
-    <b>F</b> frame robot &nbsp;·&nbsp; <b>T</b> top view &nbsp;·&nbsp; <b>G</b> toggle grid
+    <b>F</b> frame robot &nbsp;·&nbsp; <b>T</b> top view &nbsp;·&nbsp; <b>G</b> toggle grid &nbsp;·&nbsp;
+    <b>M</b> toggle /modified_map
   </div>
 
   <script type="importmap">
@@ -110,6 +113,7 @@
     const hud = {
       robot: $('hud-robot'), topic: $('hud-topic'), points: $('hud-points'),
       fps: $('hud-fps'), stream: $('hud-stream'), pose: $('hud-pose'),
+      modmap: $('hud-modmap'), mission: $('hud-mission'),
       status: $('status-waiting'), err: $('err-detail'), loading: $('loading'),
     };
     function setStatus(kind, text) {
@@ -121,6 +125,38 @@
       if (!text) { hud.err.style.display = 'none'; return; }
       hud.err.textContent = text;
       hud.err.style.display = 'block';
+    }
+
+    // ------------------------------------------------------- mission status
+    // Read-only mirror of hivemind_mission_manager, which is the "Exploring"
+    // text RViz was showing. The viewer only ever receives this over the
+    // socket; it sends nothing to the mission topics, so this cannot steer the
+    // robot.
+    //
+    // Labels and colours are keyed off the enum in
+    // go2_hardware_autonomy.hivemind_mission.MissionState. Anything else is
+    // still shown verbatim rather than falling back to "idle" -- an
+    // unrecognised state should be visible as new information, not silently
+    // disguised as a known one.
+    const MISSION_LABELS = {
+      IDLE: { text: 'Idle', colour: '#9aa0aa' },
+      EXPLORING: { text: 'Exploring', colour: '#3ddc84' },
+      MAP_COMPLETE: { text: 'Map complete', colour: '#ff3b30' },
+      READY_FOR_PATROL: { text: 'Ready for patrol', colour: '#ffd166' },
+    };
+
+    function renderMission(msg) {
+      const state = String(msg.state || '').trim().toUpperCase();
+      if (!state) return;
+      const known = MISSION_LABELS[state];
+      // Unknown state: amber rather than a "known" colour, so it is visibly
+      // different from the four states this build understands.
+      const colour = known ? known.colour : '#ff9f43';
+      const label = known ? known.text : state;
+      const who = msg.explorer_robot ? ` (explorer: ${msg.explorer_robot})` : '';
+      hud.mission.innerHTML =
+        `<b style="color:${colour}">${label}</b>` +
+        `<span style="color:#6f7684; font-weight:400"> ${state}${who}</span>`;
     }
 
     // --------------------------------------------------------------- scene
@@ -192,6 +228,41 @@
     floor.visible = false;
     scene.add(floor);
 
+    // -------------------------------------------------- modified map layer
+    // /modified_map: lidar_slam's graph-optimised map -- the dense, static
+    // cloud the real Foxglove app shows. A PointCloud2 the backend has already
+    // placed in the map frame (it applies only the Z-up -> Y-up swap, no pose
+    // transform), so unlike the rolling cloud above it does not move with the
+    // robot and is not time-windowed. It is a single global topic shared by
+    // both robots, and it is replaced wholesale each time SLAM re-optimises.
+    //
+    // Kept in its own Points object rather than merged into `cloud` so the two
+    // lifetimes stay separate: the live buffer is refilled at 10 Hz while this
+    // one is written once per pose-graph optimisation.
+    const MODMAP_MAX = 400000;            // client-side hard cap
+    const modmapPositions = new Float32Array(MODMAP_MAX * 3);
+    const modmapColors = new Float32Array(MODMAP_MAX * 3);
+    let modmapCount = 0;
+
+    const modmapGeom = new THREE.BufferGeometry();
+    modmapGeom.setAttribute('position', new THREE.BufferAttribute(modmapPositions, 3));
+    modmapGeom.setAttribute('color', new THREE.BufferAttribute(modmapColors, 3));
+    modmapGeom.setDrawRange(0, 0);
+
+    const modmapMat = new THREE.PointsMaterial({
+      size: 0.03,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: true,
+      // Lower than the live cloud so the dog stays readable on top of it.
+      opacity: 0.55,
+      depthWrite: false,
+    });
+    const modmapCloud = new THREE.Points(modmapGeom, modmapMat);
+    modmapCloud.frustumCulled = false;
+    modmapCloud.visible = true;
+    scene.add(modmapCloud);
+
     // --------------------------------------------------------- robot body
     const robotGroup = new THREE.Group();
     const body = new THREE.Mesh(
@@ -227,17 +298,76 @@
     scene.add(robotGroup);
 
     // --------------------------------------------------------- nav2 path
+    // A THREE.Line, deliberately not used here: WebGL caps line width at 1px
+    // (gl.LINE_WIDTH > 1 is not in the core profile), so a LineBasicMaterial
+    // path is a hairline no matter what you set linewidth to. Real geometry is
+    // the only way to make it read against a dense map, so the plan is swept
+    // into a tube instead. That costs a rebuild on each replan, which is
+    // cheap: the plan only changes when Nav2 publishes a new plan_stamp.
     const PATH_MAX = 4000;
-    const pathGeom = new THREE.BufferGeometry();
-    pathGeom.setAttribute('position',
-      new THREE.BufferAttribute(new Float32Array(PATH_MAX * 3), 3));
-    pathGeom.setDrawRange(0, 0);
-    const pathLine = new THREE.Line(
-      pathGeom,
-      new THREE.LineBasicMaterial({ color: 0x9be564 })
+    const PATH_COLOR = 0xff3b30;
+    const PATH_RADIUS = 0.07;
+    // Clear the plan once the robot is this close to the goal, as requested.
+    // Nav2's own xy_goal_tolerance is typically 0.25 m, so this deliberately
+    // clears a little early: the remaining plan is a stub the operator has no
+    // use for.
+    const GOAL_TOLERANCE_M = 1.0;
+
+    // End of the currently loaded plan in display coords, or null when there is
+    // no plan. Kept separate from goalGroup.visible so the "arrived" latch can
+    // be re-evaluated every frame without the visibility flag being the state.
+    let pathGoal = null;
+    let goalSatisfied = false;
+
+    const pathMesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ color: PATH_COLOR })
     );
-    pathLine.frustumCulled = false;
-    scene.add(pathLine);
+    pathMesh.frustumCulled = false;
+    pathMesh.visible = false;
+    scene.add(pathMesh);
+
+    // Goal marker, parked at the last pose of the plan. Built as three parts
+    // because a flat ring alone is edge-on and effectively invisible from a low
+    // camera or from far away, which is where the "where is it going?" question
+    // actually gets asked.
+    const goalGroup = new THREE.Group();
+    goalGroup.visible = false;
+
+    const goalRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.18, 0.30, 32),
+      new THREE.MeshBasicMaterial({
+        color: PATH_COLOR,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false
+      })
+    );
+    goalRing.rotation.x = -Math.PI / 2;
+    goalGroup.add(goalRing);
+
+    // White core against the red path, so the goal does not disappear into it.
+    const goalDot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.10, 20, 14),
+      new THREE.MeshBasicMaterial({ color: 0xffffff })
+    );
+    goalDot.position.y = 0.14;
+    goalGroup.add(goalDot);
+
+    const BEACON_H = 1.2;
+    const goalBeacon = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.012, 0.012, BEACON_H, 8),
+      new THREE.MeshBasicMaterial({
+        color: PATH_COLOR,
+        transparent: true,
+        opacity: 0.55,
+        depthWrite: false
+      })
+    );
+    goalBeacon.position.y = BEACON_H / 2;
+    goalGroup.add(goalBeacon);
+    scene.add(goalGroup);
 
     function updatePoseHud() {
       if (!lastRobotPose) return;
@@ -250,7 +380,7 @@
 
     // ----------------------------------------------------- websocket feed
     // Binary frame layout (little endian, 24-byte header):
-    //   0   u8   msg type (1 = cloud, 2 = nav path)
+    //   0   u8   msg type (1 = cloud, 2 = nav path, 3 = modified map)
     //   1   u8   flags: bit0 = robot pose present
     //   2   u16  reserved
     //   4   u32  point count N
@@ -263,6 +393,7 @@
     const HEADER_BYTES = 24;
     const MSG_CLOUD = 1;
     const MSG_PATH = 2;
+    const MSG_MAP_CLOUD = 3;
     let ws = null;
     let streamFrames = 0;
     let lastStreamCount = 0;
@@ -301,8 +432,18 @@
             const msg = JSON.parse(evt.data);
             if (msg.type === 'map' && msg.png) applyFloorTexture(msg);
             else if (msg.type === 'error') { setStatus('error', msg.message); setError(msg.detail || ''); }
-            else if (msg.type === 'topic') hud.topic.textContent = msg.topic;
+            else if (msg.type === 'topic') {
+              hud.topic.textContent = msg.topic;
+              // The modified map is a single global topic (graph_based_slam is
+              // un-namespaced), so it is deliberately NOT cleared on a robot
+              // switch -- it describes the same world for both dogs.
+              if (msg.modmap_topic && modmapCount === 0) {
+                hud.modmap.textContent =
+                  `waiting for ${msg.modmap_topic} — publishes only on pose-graph optimisation, so this can sit empty for minutes`;
+              }
+            }
             else if (msg.type === 'status') setStatus('waiting', msg.message);
+            else if (msg.type === 'mission') renderMission(msg);
             else if (msg.type === 'robots') setStatus('waiting', 'waiting for point cloud…');
           } catch (e) { console.warn('bad control message', e); }
           return;
@@ -337,6 +478,10 @@
 
       if (type === MSG_PATH) {
         applyPathFrame(buf, n);
+        return;
+      }
+      if (type === MSG_MAP_CLOUD) {
+        applyModmapFrame(buf, n);
         return;
       }
       if (type !== MSG_CLOUD || n <= 0) return;
@@ -379,16 +524,103 @@
 
     function applyPathFrame(buf, n) {
       if (n <= 0) {
-        pathGeom.setDrawRange(0, 0);
+        pathGoal = null;
+        goalSatisfied = false;
+        syncGoalVisuals();
         return;
       }
       const count = Math.min(n, PATH_MAX);
-      const attr = pathGeom.attributes.position;
       const pos = new Float32Array(buf, HEADER_BYTES, n * 3);
-      attr.array.set(pos.subarray(0, count * 3));
-      attr.needsUpdate = true;
-      pathGeom.setDrawRange(0, count);
-      pathGeom.computeBoundingSphere();
+
+      // A tube needs at least two points, and a single-pose plan carries no
+      // direction to sweep along.
+      if (count < 2) {
+        pathGoal = null;
+        goalSatisfied = false;
+        syncGoalVisuals();
+        return;
+      }
+
+      const pts = [];
+      for (let i = 0; i < count; i++) {
+        pts.push(new THREE.Vector3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]));
+      }
+
+      // 'centripetal' rather than the default uniform parameterisation: it
+      // stops the curve overshooting on tight turns in a doorway, where a
+      // corner-cutting tube would poke through a wall.
+      const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
+      const geom = new THREE.TubeGeometry(
+        curve,
+        Math.min(count, 2000),
+        PATH_RADIUS,
+        8,
+        false
+      );
+      pathMesh.geometry.dispose();
+      pathMesh.geometry = geom;
+
+      // Nav2 plans start at the robot and end at the commanded goal.
+      const goal = pts[pts.length - 1];
+      goalGroup.position.set(goal.x, goal.y, goal.z);
+      pathGoal = goal;
+
+      // Nav2 republishes the same plan while it drives it, so re-check on every
+      // arrival rather than trusting the plan to go away. Evaluating here as
+      // well as per-frame is what stops the tube flashing back into view for a
+      // single frame each time the identical plan is re-sent.
+      goalSatisfied = robotAtGoal();
+      syncGoalVisuals();
+    }
+
+    // Distance is planar: the plan's last pose and the robot pose are both ROS
+    // map-frame metres, and the scene's third axis is display -y. Comparing in
+    // the display frame means one conversion instead of two, and it is the
+    // same mapping the robot marker itself uses, so the plan clears exactly
+    // when the marker visually touches the goal.
+    function robotAtGoal() {
+      if (!pathGoal || !lastRobotPose) return false;
+      const dx = lastRobotPose.x - pathGoal.x;
+      const dz = -lastRobotPose.y - pathGoal.z;
+      return Math.hypot(dx, dz) <= GOAL_TOLERANCE_M;
+    }
+
+    function syncGoalVisuals() {
+      const show = pathGoal !== null && !goalSatisfied;
+      pathMesh.visible = show;
+      goalGroup.visible = show;
+    }
+
+    // The graph-optimised map layer. Byte layout matches the cloud frame, so
+    // the decode below mirrors applyCloudFrame rather than inventing a second
+    // format; the only difference is that it replaces the previous layer
+    // wholesale instead of appending, and that it carries no robot pose.
+    function applyModmapFrame(buf, n) {
+      if (n <= 0) {
+        modmapCount = 0;
+        modmapGeom.setDrawRange(0, 0);
+        hud.modmap.textContent = '0';
+        return;
+      }
+      const count = Math.min(n, MODMAP_MAX);
+      if (buf.byteLength < HEADER_BYTES + n * 15) return;
+
+      const pos = new Float32Array(buf, HEADER_BYTES, n * 3);
+      const colBytes = new Uint8Array(buf, HEADER_BYTES + n * 12, n * 3);
+      modmapPositions.set(pos.subarray(0, count * 3));
+      // uint8 0-255 -> float 0-1, same normalisation the cloud applies.
+      for (let i = 0, j = 0; i < count * 3; i += 3, j += 3) {
+        modmapColors[i] = colBytes[j] / 255;
+        modmapColors[i + 1] = colBytes[j + 1] / 255;
+        modmapColors[i + 2] = colBytes[j + 2] / 255;
+      }
+      modmapGeom.attributes.position.needsUpdate = true;
+      modmapGeom.attributes.color.needsUpdate = true;
+      modmapGeom.setDrawRange(0, count);
+      modmapGeom.computeBoundingSphere();
+      modmapCount = count;
+
+      hud.modmap.textContent = count.toLocaleString();
     }
 
     function applyFloorTexture(msg) {
@@ -443,6 +675,12 @@
       if (e.key === 'f' || e.key === 'F') frameOnRobot();
       else if (e.key === 't' || e.key === 'T') topView();
       else if (e.key === 'g' || e.key === 'G') grid.visible = !grid.visible;
+      else if (e.key === 'm' || e.key === 'M') {
+        // Toggle the graph-optimised map layer without losing the buffer, so
+        // it can be switched off and back for comparison.
+        modmapCloud.visible = !modmapCloud.visible;
+        hud.modmap.style.opacity = modmapCloud.visible ? '1' : '0.4';
+      }
     });
 
     window.addEventListener('resize', () => {
@@ -470,6 +708,23 @@
         // ROS yaw turns about +Z; in the display frame that is -Y, hence the
         // negation. (Signed consistently with the axis flip above.)
         robotGroup.rotation.y = -lastRobotPose.yaw;
+      }
+
+      // Clear the plan the moment the robot arrives, not only when a new one
+      // arrives. Nav2 keeps republishing the plan it is currently executing,
+      // so waiting for the plan to disappear would leave a stale red tube
+      // sitting on a goal the robot is already parked on.
+      if (pathGoal && !goalSatisfied && robotAtGoal()) {
+        goalSatisfied = true;
+        syncGoalVisuals();
+      }
+
+      // Slow breathing pulse on the goal ring. A static marker still gets lost
+      // in a dense cloud when the camera is panned away and back; the pulse
+      // keeps the eye on it. Cheap: one scalar scale per frame.
+      if (goalGroup.visible) {
+        const s = 1 + 0.18 * Math.sin(performance.now() * 0.0035);
+        goalRing.scale.set(s, s, 1);
       }
 
       controls.update();

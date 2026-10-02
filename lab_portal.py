@@ -271,6 +271,20 @@ def _foxglove_status_html(note=None):
     bits.append(f"viewer online · port {info.get('port', FOXGLOVE_PORT)}")
     bits.append(f"{info.get('max_points_per_frame')} pts/frame @ "
                 f"{info.get('target_fps')} fps")
+
+    # The graph-optimised map is one global topic (graph_based_slam publishes it
+    # un-namespaced), so it is reported once here rather than under each robot.
+    mm = info.get("modified_map") or {}
+    if mm.get("modified_map_msgs"):
+        age = mm.get("last_modified_map_age")
+        age_s = f", {age:.0f}s ago" if age is not None else ""
+        bits.append(f"🗺 modified map {mm['modified_map_points']:,} pts"
+                    f" on {mm.get('modified_map_topic')}{age_s}")
+    elif mm.get("modified_map_topic"):
+        # Names the topic so "nothing on it yet" is distinguishable from
+        # "not wired up" -- identical from inside the 3D panel.
+        bits.append(f"🗺 modified map: none on {mm['modified_map_topic']}")
+
     robots = info.get("robots") or {}
     for ns, st in robots.items():
         label = ns.capitalize()
@@ -288,7 +302,13 @@ def _foxglove_status_html(note=None):
         if st.get("plan_points"):
             extra.append(f"path:{st['plan_points']}")
         if st.get("dropped_no_pose"):
-            extra.append(f"waiting for pose ({st['dropped_no_pose']:,} pts held)")
+            # "dropping", not "held": _on_cloud discards these points, there is
+            # nowhere to put them. Reported as a rate because the cumulative
+            # total is meaningless for a robot that never gets a pose.
+            rate = st.get("dropped_no_pose_rate")
+            rate_s = f" ({rate:,} pts/s)" if rate else ""
+            extra.append(f"no pose — discarding "
+                         f"{st['dropped_no_pose']:,} pts{rate_s}")
         if st.get("last_error"):
             extra.append(f"error: {st['last_error'][:80]}")
         bits.append(f"{label}: {cloud}"
