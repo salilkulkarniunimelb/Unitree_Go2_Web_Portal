@@ -80,10 +80,8 @@
 
   <div id="hud">
     <div><b>Robot</b> <span class="val" id="hud-robot">Luna</span> &nbsp;|&nbsp; <b>Frame</b> <span class="val">map</span></div>
-    <div><b>Topic</b> <span class="val" id="hud-topic">(resolving&hellip;)</span></div>
     <div><b>Points</b> <span class="val" id="hud-points">0</span> &nbsp;|&nbsp; <b>Render</b> <span class="val" id="hud-fps">0 fps</span> &nbsp;|&nbsp; <b>Stream</b> <span class="val" id="hud-stream">0 fps</span></div>
     <div><b>Mission</b> <span class="val" id="hud-mission">connecting to /hivemind/mission_state&hellip;</span></div>
-    <div><b>Modified map</b> <span class="val" id="hud-modmap">waiting for /modified_map&hellip; (only publishes on pose-graph optimisation)</span></div>
     <div><b>Robot pose</b> <span class="val" id="hud-pose">x &ndash; y &ndash; yaw &ndash;</span></div>
     <div><b>Status</b> <span id="status-waiting">connecting&hellip;</span></div>
   </div>
@@ -111,9 +109,9 @@
     // ------------------------------------------------------------------ HUD
     const $ = (id) => document.getElementById(id);
     const hud = {
-      robot: $('hud-robot'), topic: $('hud-topic'), points: $('hud-points'),
+      robot: $('hud-robot'), points: $('hud-points'),
       fps: $('hud-fps'), stream: $('hud-stream'), pose: $('hud-pose'),
-      modmap: $('hud-modmap'), mission: $('hud-mission'),
+      mission: $('hud-mission'),
       status: $('status-waiting'), err: $('err-detail'), loading: $('loading'),
     };
     function setStatus(kind, text) {
@@ -154,14 +152,11 @@
       // forever -- so the dog looks like it is still exploring hours after it
       // stopped. Grey and explicit beats a green lie.
       if (msg.stale) {
-        const age = msg.age;
-        const how = age == null ? 'never received any update'
-          : `no update for ${Math.round(age)}s`;
-        const last = state ? ` (last seen: ${state})` : '';
+        // Kept to the bare label per request: the longer "no update for Ns --
+        // the mission manager looks stopped" wording was more explanation than
+        // this readout needed, and it repeated a fact the Status row covers.
         hud.mission.innerHTML =
-          `<b style="color:#9aa0aa">Mission state unavailable</b>` +
-          `<span style="color:#6f7684; font-weight:400"> ${how} — ` +
-          `the mission manager looks stopped${last}</span>`;
+          `<b style="color:#9aa0aa">Mission state unavailable</b>`;
         return;
       }
 
@@ -260,7 +255,6 @@
     const MODMAP_MAX = 400000;            // client-side hard cap
     const modmapPositions = new Float32Array(MODMAP_MAX * 3);
     const modmapColors = new Float32Array(MODMAP_MAX * 3);
-    let modmapCount = 0;
 
     const modmapGeom = new THREE.BufferGeometry();
     modmapGeom.setAttribute('position', new THREE.BufferAttribute(modmapPositions, 3));
@@ -424,7 +418,6 @@
       wantedRobot = params.get('robot') || 'Luna';
       const ns = wantedRobot.toLowerCase();
       hud.robot.textContent = wantedRobot;
-      hud.topic.textContent = '(resolving…)';   // backend sends the live topic
 
       const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
       // Same origin: the viewer page and the socket are served by the same
@@ -451,14 +444,11 @@
             if (msg.type === 'map' && msg.png) applyFloorTexture(msg);
             else if (msg.type === 'error') { setStatus('error', msg.message); setError(msg.detail || ''); }
             else if (msg.type === 'topic') {
-              hud.topic.textContent = msg.topic;
-              // The modified map is a single global topic (graph_based_slam is
-              // un-namespaced), so it is deliberately NOT cleared on a robot
-              // switch -- it describes the same world for both dogs.
-              if (msg.modmap_topic && modmapCount === 0) {
-                hud.modmap.textContent =
-                  `waiting for ${msg.modmap_topic} — publishes only on pose-graph optimisation, so this can sit empty for minutes`;
-              }
+              // The Topic and Modified map HUD rows are gone, so there is
+              // nothing to write here. The modified map is a single global
+              // topic (graph_based_slam is un-namespaced), so it is
+              // deliberately NOT cleared on a robot switch -- it describes the
+              // same world for both dogs.
             }
             else if (msg.type === 'status') setStatus('waiting', msg.message);
             else if (msg.type === 'mission') renderMission(msg);
@@ -615,9 +605,7 @@
     // wholesale instead of appending, and that it carries no robot pose.
     function applyModmapFrame(buf, n) {
       if (n <= 0) {
-        modmapCount = 0;
         modmapGeom.setDrawRange(0, 0);
-        hud.modmap.textContent = '0';
         return;
       }
       const count = Math.min(n, MODMAP_MAX);
@@ -636,9 +624,6 @@
       modmapGeom.attributes.color.needsUpdate = true;
       modmapGeom.setDrawRange(0, count);
       modmapGeom.computeBoundingSphere();
-      modmapCount = count;
-
-      hud.modmap.textContent = count.toLocaleString();
     }
 
     function applyFloorTexture(msg) {
@@ -697,7 +682,6 @@
         // Toggle the graph-optimised map layer without losing the buffer, so
         // it can be switched off and back for comparison.
         modmapCloud.visible = !modmapCloud.visible;
-        hud.modmap.style.opacity = modmapCloud.visible ? '1' : '0.4';
       }
     });
 
