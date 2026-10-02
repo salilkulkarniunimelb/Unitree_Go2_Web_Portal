@@ -2154,15 +2154,14 @@ def main():
                             interactive=False)
 
                 # ================================================================
-                # BOTTOM ROW: TELEMETRY + STATUS FOOTER
+                # BOTTOM ROW: POSE + STATUS FOOTER
+                # Battery / Orientation / Motor Temps were removed at the
+                # operator's request. Their callbacks and the ROS
+                # subscriptions that feed them are left in place: other
+                # panels and the /health diagnostics still read the same
+                # values, so only the Mapping page display is gone.
                 # ================================================================
-                with gr.Row():
-                    with gr.Column():
-                        battery_out = gr.Textbox(label="🔋 Battery", lines=2)
-                        orient_out = gr.Textbox(label="📐 Orientation", lines=2)
-                    with gr.Column():
-                        pose_out = gr.Textbox(label="📍 Pose", lines=2)
-                        motor_out = gr.Textbox(label="🌡️ Motor Temps", lines=3)
+                pose_out = gr.Textbox(label="📍 Pose", lines=2)
 
                 conn_out = gr.Textbox(label="Connection Status", lines=2, interactive=False)
 
@@ -2184,13 +2183,10 @@ def main():
                 status_timer.tick(
                     lambda: (
                         node.get_connection_status(),
-                        node.get_battery_data(),
-                        node.get_motor_data(),
-                        node.get_orientation_data(),
                         node.get_pose_data(),
                         f"{node.current_robot.cam_fps:.1f} fps",
                     ),
-                    outputs=[conn_out, battery_out, motor_out, orient_out, pose_out, cam_fps_out],
+                    outputs=[conn_out, pose_out, cam_fps_out],
                 )
 
                 # Populate per-robot status cards
