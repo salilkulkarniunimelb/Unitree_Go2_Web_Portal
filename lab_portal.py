@@ -2134,12 +2134,9 @@ def main():
                 with gr.Row():
                     with gr.Column(scale=1):
                         gr.Markdown("#### EXPLORER")
-                        gr.Markdown(
-                            "Builds the split-compute explorer and launches it "
-                            "for the robot selected above, starting that robot's "
-                            "Zenoh bridge first. Runs on the server host, so the "
-                            "log below updates as the build progresses."
-                        )
+                        # The explanatory blurb was removed at the operator's
+                        # request. The section is now just the heading, the two
+                        # buttons and the log, which is self-explanatory.
                         with gr.Row():
                             explore_start_btn = gr.Button(
                                 "Start Exploring", variant="primary")
