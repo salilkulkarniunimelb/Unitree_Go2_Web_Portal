@@ -507,8 +507,10 @@ DASHBOARD_CSS = """
     /* Keep the label legible once the background is a saturated colour. */
     .explore-start-btn:hover *,.explore-stop-btn:hover *{color:#fff !important;}
     .goal-enable-btn,.goal-disable-btn{transition:background-color .15s ease,box-shadow .15s ease;}
-    .goal-enable-btn:hover{background-color:#1565c0 !important;
-        box-shadow:0 0 0 2px rgba(21,101,192,.45) !important;}
+    /* Same green as .explore-start-btn: enabling is the affirmative action
+       in both sections, so they should look identical on hover. */
+    .goal-enable-btn:hover{background-color:#2e7d32 !important;
+        box-shadow:0 0 0 2px rgba(46,125,50,.45) !important;}
     .goal-disable-btn:hover{background-color:#c62828 !important;
         box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
     .goal-enable-btn:hover *,.goal-disable-btn:hover *{color:#fff !important;}
@@ -2360,14 +2362,25 @@ def main():
                 # The logs themselves are untouched: the 2s timer still writes
                 # to both textboxes whether or not they are on screen, so
                 # pressing Show Logs after a run shows what already accumulated.
+                logs_visible = gr.State(value=False)
+
                 show_logs_btn = gr.Button(
                     "Show Logs", variant="secondary")
 
-                def on_show_logs():
-                    return gr.Column(visible=True)
+                # Mirrors how "Set Initial Pose" behaves (see
+                # toggle_initpose_section above): a gr.State holds the current
+                # visibility, the click flips it, the panel follows the state
+                # and the button relabels itself to the inverse action. State
+                # defaults to False, so every page load starts from Show Logs
+                # with both logs hidden.
+                def on_toggle_logs(visible):
+                    new_visible = not visible
+                    label = ("Hide Logs" if new_visible else "Show Logs")
+                    return new_visible, gr.update(visible=new_visible), gr.update(value=label)
 
                 show_logs_btn.click(
-                    on_show_logs, inputs=None, outputs=logs_panel,
+                    on_toggle_logs, inputs=logs_visible,
+                    outputs=[logs_visible, logs_panel, show_logs_btn],
                     api_name="show_logs")
 
                 # api_name exposes these as Gradio API endpoints
