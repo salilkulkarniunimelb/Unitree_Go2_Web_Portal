@@ -159,51 +159,43 @@ def get_index_page(demo,launcher):
 
 
 
-                with gr.Row():
+                with gr.Row(elem_classes=["pose-status-grid"]):
 
-                    
-                    with gr.Row():
-
-                        # --- Position Box ---
+                    # --- Pose Section (left) ---
+                    with gr.Column(scale=1, min_width=300):
                         with gr.Group():
                             position_val = gr.Textbox(label=" 📍 Position", lines=1)
-
-                        # --- Orientation Box ---
-                        with gr.Group():
                             orientation_val = gr.Textbox(label=" 🧭 Orientation (radians)", lines=1)
-
-                        # --- Velocity Box ---
-                        with gr.Group():
                             velocity_val = gr.Textbox(label=" ⚡ Velocity", lines=1)
-                        
+
+                    # --- Connection Status Section (right) ---
+                    with gr.Column(scale=1, min_width=300):
                         with gr.Group():
                             battery_val = gr.Textbox(label=" 🔋 Battery", lines=2)
-                        
-                        with gr.Group():
                             system_val = gr.Textbox(label="⚙️ System", lines=1)
 
 
-                        def update_all_wrapper():
-                            pos, _, vel = launcher.map_subscriber.get_live_data()
-                            orient =launcher.bm_subscriber.get_orientation_data()
-                            battery = launcher.bm_subscriber.get_battery_data()
-                            system = launcher.bm_subscriber.get_system_state_data()
+                def update_all_wrapper():
+                    pos, _, vel = launcher.map_subscriber.get_live_data()
+                    orient =launcher.bm_subscriber.get_orientation_data()
+                    battery = launcher.bm_subscriber.get_battery_data()
+                    system = launcher.bm_subscriber.get_system_state_data()
 
 
-                            return pos, orient, vel, battery, system
-                        
-                        timer = gr.Timer(0.5)
-                        timer.tick(
-                            fn=update_all_wrapper,
-                            inputs=None,
-                            outputs=[
-                                position_val,
-                                orientation_val,
-                                velocity_val,
-                                battery_val,
-                                system_val
-                            ]
-                        )
+                    return pos, orient, vel, battery, system
+                
+                timer = gr.Timer(0.5)
+                timer.tick(
+                    fn=update_all_wrapper,
+                    inputs=None,
+                    outputs=[
+                        position_val,
+                        orientation_val,
+                        velocity_val,
+                        battery_val,
+                        system_val
+                    ]
+                )
 
                     # )
     # event_timer = gr.Timer(1.0)

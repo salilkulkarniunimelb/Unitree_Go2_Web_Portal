@@ -6,6 +6,13 @@
     height: 82vh;
     gap: 1rem;
 }
+
+/* ---- POSE & CONNECTION STATUS GRID ---- */
+.pose-status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+}
 .left-pane, .right-pane {
     background: var(--background-fill-secondary);
     color: var(--body-text-color);
