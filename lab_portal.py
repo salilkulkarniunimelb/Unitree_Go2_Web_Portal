@@ -2144,11 +2144,9 @@ def main():
                                 "Stop Exploring", variant="stop")
                         explore_status = gr.Textbox(
                             label="Explorer Status", lines=2, interactive=False)
-                    with gr.Column(scale=2):
-                        gr.Markdown("#### EXPLORER LOG (tail)")
-                        explore_log = gr.Textbox(
-                            show_label=False, lines=12, max_lines=12,
-                            interactive=False)
+                    # The log used to sit in a scale=2 column beside these
+                    # controls. It is now the last thing on the Mapping page (see
+                    # the bottom of this tab), so the section is a single column.
 
                 # ================================================================
                 # BOTTOM ROW: POSE + STATUS FOOTER
@@ -2296,6 +2294,16 @@ def main():
                             time.time() - _action_msg["at"] < ACTION_MSG_TTL:
                         status = f"{_action_msg['text']}\n{status}"
                     return status, log
+
+                # ---------- BOTTOM: EXPLORER LOG ----------
+                # Declared last so it renders at the foot of the page: Gradio
+                # orders components by declaration order. The wiring below has
+                # to stay after this, because .click()/.tick() read explore_log
+                # when they are registered, so it must already exist by then.
+                gr.Markdown("#### EXPLORER LOG")
+                explore_log = gr.Textbox(
+                    show_label=False, lines=12, max_lines=12,
+                    interactive=False)
 
                 # api_name exposes these as Gradio API endpoints
                 # (POST /gradio_api/call/start_exploring with {"data": ["Luna"]}),
