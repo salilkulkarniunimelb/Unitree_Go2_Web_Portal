@@ -15,7 +15,14 @@
 # Usage:
 #   bash restore_dashboard.sh
 #
-# After breaking lab_portal.py:  git checkout 29555bd -- lab_portal.py && bash restore_dashboard.sh
+# After breaking lab_portal.py:  git checkout HEAD -- lab_portal.py && bash restore_dashboard.sh
+#
+# NOTE: this script copies lab_portal.py but NOT the 3D viewer bundle (the
+# "3D Map" tab). It is therefore safe to use ONLY for the portal itself: it
+# leaves web_backend/foxglove_viewer.py and web_frontend/ alone, so it cannot
+# overwrite them. If the container is RECREATED from the image, however, the
+# viewer comes back at whatever the image has baked in, not at your working
+# copy -- for that case run deploy_lab_portal.sh, which ships the viewer too.
 # ---------------------------------------------------------------------------
 set -e
 
@@ -54,7 +61,7 @@ echo "============================================================"
 
 # --- 1) Make sure the portal files exist locally ---------------------------
 for f in $FILES; do
-    [ -f "$f" ] || { echo "ERROR: $f missing. Run from the repo root, or restore it: git checkout 29555bd -- $f"; exit 1; }
+    [ -f "$f" ] || { echo "ERROR: $f missing. Run from the repo root, or restore it: git checkout HEAD -- $f"; exit 1; }
 done
 for f in $HOST_SETUP_FILES; do
     [ -f "$f" ] || { echo "WARNING: $f missing -- the Start Exploring button will not work."; }
@@ -85,6 +92,13 @@ if ! $SSH "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "  -> Container missing. Recreating from $IMAGE (host networking, auto-boot)..."
     $SSH "docker run -d --name $CONTAINER --network host --restart unless-stopped -e ROS_DOMAIN_ID=$ROS_DOMAIN $IMAGE $ENTRYPOINT"
     echo "  -> Container recreated. It will be restarted at [6/7] to pick up the copied boot.sh."
+    # The 3D Map tab lives in the viewer bundle, which this script does NOT
+    # copy. A fresh container therefore starts with whatever the IMAGE has
+    # baked in, so say so rather than letting the tab silently regress.
+    echo "  -> WARNING: this container was rebuilt from the image, so the '3D Map'"
+    echo "     tab may be an OLD version. After this finishes, run:"
+    echo "       bash deploy_lab_portal.sh"
+    echo "     to ship the current viewer (foxglove_viewer.py + foxglove_view.html)."
 else
     if ! $SSH "docker inspect -f '{{.State.Running}}' $CONTAINER" | grep -q true; then
         echo "  -> Container exists but stopped. Starting it..."
