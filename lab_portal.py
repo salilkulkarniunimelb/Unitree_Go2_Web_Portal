@@ -2004,6 +2004,19 @@ def main():
 
                         map_img = gr.Image(show_label=False,
                                            type="numpy", elem_id="map_image", height=520)
+
+                        # Jump to the 3D view of the same world, placed above
+                        # the goal status so the map, the hop and the goal
+                        # readout stay adjacent. Navigation only: no data path,
+                        # subscription or timer is touched, and the 2D map keeps
+                        # running untouched on its own tab.
+                        switch_to_3d_btn = gr.Button(
+                            "Switch to 3D", variant="secondary",
+                            elem_classes=["switch-view-btn"])
+                        switch_to_3d_btn.click(
+                            _goto_tab("foxglove-ui"),
+                            inputs=None, outputs=page_tabs)
+
                         goal_out = gr.Textbox(label="Goal Status", lines=1)
 
                         with gr.Row():
@@ -2018,12 +2031,7 @@ def main():
                         # navigation: no data path, no subscription and no timer
                         # is touched, and the 2D map keeps running untouched on
                         # its own tab.
-                        switch_to_3d_btn = gr.Button(
-                            "Switch to 3D", variant="secondary",
-                            elem_classes=["switch-view-btn"])
-                        switch_to_3d_btn.click(
-                            _goto_tab("foxglove-ui"),
-                            inputs=None, outputs=page_tabs)
+                        
 
                     # ---------- RIGHT: LIVE CAMERA ----------
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
@@ -2363,7 +2371,11 @@ def main():
                     value=_foxglove_status_html("starting"),
                     elem_classes=["foxglove-status"],
                 )
+
                 # The reciprocal hop, so "Switch to 3D" is not a one-way door.
+                # Sits directly above the status strip, which keeps it next to
+                # the other page-level control rather than under the tall iframe
+                # where it is far below the fold on a laptop screen.
                 switch_to_2d_btn = gr.Button(
                     "Switch to 2D", variant="secondary",
                     elem_classes=["switch-view-btn"])
