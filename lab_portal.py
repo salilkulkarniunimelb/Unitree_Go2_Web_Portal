@@ -301,14 +301,11 @@ def _foxglove_status_html(note=None):
             extra.append("map ✓")
         if st.get("plan_points"):
             extra.append(f"path:{st['plan_points']}")
-        if st.get("dropped_no_pose"):
-            # "dropping", not "held": _on_cloud discards these points, there is
-            # nowhere to put them. Reported as a rate because the cumulative
-            # total is meaningless for a robot that never gets a pose.
-            rate = st.get("dropped_no_pose_rate")
-            rate_s = f" ({rate:,} pts/s)" if rate else ""
-            extra.append(f"no pose — discarding "
-                         f"{st['dropped_no_pose']:,} pts{rate_s}")
+        # Dropped-without-pose points are deliberately not surfaced here. It
+        # dominated the strip -- a robot that never gets a pose accrues a
+        # seven-figure total that grows forever and tells the operator nothing
+        # they can act on. It stays in /health (dropped_no_pose and
+        # dropped_no_pose_rate) for when the counter is the actual question.
         if st.get("last_error"):
             extra.append(f"error: {st['last_error'][:80]}")
         bits.append(f"{label}: {cloud}"
