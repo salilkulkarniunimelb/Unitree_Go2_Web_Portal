@@ -105,9 +105,10 @@ case "$ACTION" in
         esac
         ;;
     stop|status|log) ;;
-    # Patrol server (Goal Setting). No robot argument: it brings up
-    # localisation + the patrol UI for BOTH robots from the shared completed
-    # map, so there is nothing to select here.
+    # Localisation server (Goal Setting). No robot argument: one server-side
+    # map_server plus relays republish the completed map to BOTH robots'
+    # namespaces, so there is nothing to select here. The patrol UI is NOT part
+    # of this launch -- see do_patrol_start for why.
     patrol-start|patrol-stop|patrol-status|patrol-log) ;;
     *) usage ;;
 esac
@@ -295,10 +296,37 @@ do_patrol_start() {
             exit 2
         fi
 
+        # Only the LOCALISATION server, not orchestrator/hivemind_patrol_server.
+        #
+        # hivemind_patrol_server.launch.py also includes edge_patrol_ui, whose
+        # patrol_testbench process imports scipy.ndimage. In robot_hivemind that
+        # import is broken (numpy 2.2.6 against a scipy 1.8.0 built for numpy
+        # <1.25: "ImportError: numpy.core.multiarray failed to import"), so that
+        # node died within a second of every launch and took the whole
+        # launch down with it -- map_server and the four map relays included,
+        # leaving /luna/lidar_slam_2d_map and /astro/lidar_slam_2d_map with no
+        # publisher at all. That is why the map never appeared.
+        #
+        # go2_hivemind_localization_server_launch.py is the localisation half of
+        # that same include tree, and it is scipy-free. It runs map_server plus
+        # occupancy_grid_relay_node for BOTH robots -- /luna/map, /astro/map,
+        # /luna/lidar_slam_2d_map and /astro/lidar_slam_2d_map -- which is
+        # exactly the pair of topics the two dashboard map panels subscribe to
+        # (lab_portal.py LUNA_TOPICS/ASTRO_TOPICS). One launch, both robots.
+        #
+        # The arg is map_file, not map_yaml: hivemind_patrol_server renamed it
+        # on the way in. explorer_robot is deliberately not passed -- it only
+        # picks a default filename, and map_file overrides that anyway.
+        #
+        # Foxglove is left off because the container already has bridges bound
+        # to 8765; a fifth one would fail to bind and die.
+        #
         # Detached with setsid for the same reason as the explorer: stop has to
         # be able to signal the whole process group.
-        setsid ros2 launch orchestrator hivemind_patrol_server.launch.py \
-            map_yaml:='"$PATROL_MAP"' \
+        setsid ros2 launch go2_hardware_autonomy \
+            go2_hivemind_localization_server_launch.py \
+            map_file:='"$PATROL_MAP"' \
+            launch_foxglove_bridge:=false \
             > '"$PATROL_LOGFILE"' 2>&1 < /dev/null &
         echo $! > '"$PATROL_PIDFILE"'
         # A bad launch file exits within a second or so; surface that as a real
