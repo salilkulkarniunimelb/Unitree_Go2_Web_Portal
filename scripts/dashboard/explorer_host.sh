@@ -63,7 +63,20 @@ LAUNCH_LOGFILE=/workspace/explorer_launch.log
 PATROL_PIDFILE=/workspace/.patrol_launch.pid
 PATROL_LOGFILE=/workspace/patrol_launch.log
 # The completed map the robots localise on after exploring.
-PATROL_MAP=/workspace/hardware_code/maps/amcl_completed_map.yaml
+#
+# luna_amcl_completed_map.yaml is the one the explorer writes INSIDE the
+# container, and it is the only candidate that is: it is owned by root and
+# dated with the exploration run, while amcl_completed_map.yaml and
+# luna_amcl_completed_map20261001.yaml are both owned by the host pull
+# user (1017) and are three days older. It is also the built-in default of
+# hivemind_patrol_server.launch.py, so naming it explicitly here keeps the
+# two in agreement.
+#
+# The <explorer_robot>_amcl_completed_map.yaml shape is not a coincidence:
+# it is what go2_hivemind_localization_server_launch.py builds out of its
+# explorer_robot argument. Only "luna" is meaningful -- Astro has never
+# written a map here.
+PATROL_MAP=/workspace/hardware_code/maps/luna_amcl_completed_map.yaml
 
 PHASE="[explorer] PHASE="
 log()  { echo "[explorer] $*"; }
