@@ -1272,30 +1272,54 @@ def make_process_request(bridge):
     differ only by path and the client never has to know the port twice. This
     hook is what makes that possible: it runs on every inbound request and gets
     to answer the non-WebSocket ones itself.
+
+    Two generations of websockets call this hook, and they disagree on both the
+    arguments and the return type:
+
+    * the asyncio server (websockets >= 14, what the portal container runs)
+      calls ``process_request(connection, request)`` and wants a
+      ``websockets.http11.Response`` back;
+    * the legacy server (websockets <= 13, e.g. 12.0 on a dev laptop) calls
+      ``process_request(path, headers)`` and wants a ``(status, headers,
+      body)`` tuple -- it unpacks the result straight into AbortHandshake.
+
+    The first argument is the discriminator: the legacy server passes the
+    request path as a str, the asyncio server passes the connection object.
     """
 
-    async def process_request(connection, request):
-        path = request.path.split("?", 1)[0]
+    async def process_request(connection_or_path, request_or_headers):
+        modern = not isinstance(connection_or_path, str)
+        if modern:
+            path = request_or_headers.path.split("?", 1)[0]
+        else:
+            path = connection_or_path.split("?", 1)[0]
         # Returning None lets the request continue to the opening handshake.
         # Anything not claimed here must fall through, or the socket is dead:
         # the handshake only happens for requests this hook declines to answer.
         if path == WS_PATH:
             return None
         if path == "/health":
-            return _http_response(200, json.dumps(bridge.health(),
-                                                  indent=2).encode(),
-                                  "application/json")
-        if path in ("/", "/index.html", "/foxglove"):
+            response = _http_response(200, json.dumps(bridge.health(),
+                                                      indent=2).encode(),
+                                      "application/json")
+        elif path in ("/", "/index.html", "/foxglove"):
             body, ctype = _read_static("foxglove_view.html")
             if body is None:
-                return _http_response(
+                response = _http_response(
                     500, b"foxglove_view.html missing from web_frontend/",
                     "text/plain; charset=utf-8")
-            return _http_response(200, body, ctype)
-        body, ctype = _read_static(path)
-        if body is None:
-            return _http_response(404, b"not found", "text/plain; charset=utf-8")
-        return _http_response(200, body, ctype)
+            else:
+                response = _http_response(200, body, ctype)
+        else:
+            body, ctype = _read_static(path)
+            if body is None:
+                response = _http_response(404, b"not found",
+                                          "text/plain; charset=utf-8")
+            else:
+                response = _http_response(200, body, ctype)
+        if modern:
+            return response
+        return response.status_code, response.headers, response.body
 
     return process_request
 
