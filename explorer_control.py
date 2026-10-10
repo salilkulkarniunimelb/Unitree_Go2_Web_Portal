@@ -465,6 +465,16 @@ def _streaming_status(namespace, started_at, phase):
 # seconds and must not spawn an ssh process each time.
 _patrol_cache = {"at": 0.0, "running": False}
 
+# Saved-map picker. A map is only ever a bare basename in the maps directory
+# the host script exposes, so this mirrors that grammar exactly: the host
+# script is still the authority, but rejecting a bad name here keeps a typo or
+# a crafted value from becoming an ssh request at all.
+MAP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.yaml$")
+# Listing maps is a page-load nicety, not a control action, so it gets a
+# shorter leash than start/stop: if the server is slow the picker just comes
+# up empty instead of holding the dashboard for the full call timeout.
+LIST_TIMEOUT_S = 12.0
+
 
 def _invalidate_patrol():
     _patrol_cache.update({"at": 0.0, "running": False})
@@ -482,10 +492,71 @@ def _patrol_remote_status(max_age=_REMOTE_TTL_S):
     return running
 
 
-def patrol_start():
-    """Start the patrol server on the completed map. Returns (status, log)."""
+def _map_age_label(name, age_s):
+    """Human label for a map picker entry: filename plus a coarse age."""
+    if age_s is None:
+        return name
+    if age_s < 90:
+        when = "just now"
+    elif age_s < 3600:
+        when = f"{age_s / 60:.0f} min ago"
+    elif age_s < 86400:
+        when = f"{age_s / 3600:.0f} h ago"
+    else:
+        when = f"{age_s / 86400:.0f} d ago"
+    return f"{name}  ({when})"
+
+
+def list_maps():
+    """Saved maps the host can localise on. Returns (choices, error).
+
+    choices is a list of (label, value) newest-first for a Gradio dropdown,
+    where value is the bare .yaml basename the host accepts. On any failure
+    choices is empty and error explains why, so the dashboard can say
+    something useful rather than silently showing an empty picker.
+    """
+    rc, out = _ssh_call("list-maps", timeout=LIST_TIMEOUT_S)
+    if rc is None:
+        return [], out
+    if rc != 0:
+        if "CONTAINER_DOWN" in out:
+            return [], ("the robot container is not running, so saved maps "
+                        "cannot be listed yet")
+        return [], (out.strip() or f"list-maps failed (exit {rc})")
+
+    now = time.time()
+    choices = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        mtime_s, _, name = line.partition("|")
+        name = name.strip()
+        if not MAP_NAME_RE.match(name):
+            continue
+        try:
+            age = now - float(mtime_s)
+        except ValueError:
+            age = None
+        choices.append((_map_age_label(name, age), name))
+    return choices, None
+
+
+def patrol_start(map_name=None):
+    """Start the patrol server, optionally on a chosen saved map.
+
+    map_name selects a *.yaml in the maps directory; None keeps the server's
+    default, which is the latest map the explorer wrote. Returns (status, log).
+    """
+    if map_name:
+        if not MAP_NAME_RE.match(map_name):
+            return (f"❌ {map_name!r} is not a valid map file.", _patrol_log())
+        request = f"patrol-start {map_name}"
+    else:
+        request = "patrol-start"
+
     with _lock:
-        rc, out = _ssh_call("patrol-start", timeout=STOP_TIMEOUT_S)
+        rc, out = _ssh_call(request, timeout=STOP_TIMEOUT_S)
         _invalidate_patrol()
 
         log = _patrol_log()
@@ -496,8 +567,11 @@ def patrol_start():
             # The host prints PATROL_LAUNCH_FAILED plus the tail of the launch
             # log when the launch dies immediately; surface that rather than a
             # bare exit code, because the usual cause is a bad launch file.
+            if "PATROL_MAP_INVALID" in out:
+                return (f"❌ {map_name!r} is not a valid map name.", log)
             if "PATROL_MAP_MISSING" in out:
-                return ("❌ The completed map was not found in the robot "
+                which = map_name or "completed map"
+                return (f"❌ The map {which!r} was not found in the robot "
                         "container, so nothing was started. See the log.", log)
             if "PATROL_LAUNCH_FAILED" in out:
                 detail = "\n".join(out.strip().splitlines()[-12:])
@@ -506,9 +580,10 @@ def patrol_start():
             detail = out.strip().splitlines()[-1] if out.strip() else f"exit {rc}"
             return (f"❌ Could not start the patrol server: {detail}", log)
 
-        return ("✅ Goal Setting enabled: the patrol server is bringing up "
-                "localisation on the completed map and the patrol UI. Give it "
-                "a few seconds, then set a goal.", log)
+        which = map_name or "the latest completed map"
+        return (f"✅ Goal Setting enabled on {which}: the patrol server is "
+                "bringing up localisation and the patrol UI. Give it a few "
+                "seconds, then set a goal.", log)
 
 
 def patrol_stop():

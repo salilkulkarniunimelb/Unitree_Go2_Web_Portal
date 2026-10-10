@@ -2178,6 +2178,19 @@ def main():
                     # Exploring leaves running.
                     with gr.Column(scale=1, min_width=320):
                         gr.Markdown("#### GOAL SETTING")
+                        # Load a map instead of re-exploring: pick a saved map
+                        # (or the latest one exploration wrote) and Enable Goal
+                        # Setting localises BOTH robots on it. Choices are the
+                        # *.yaml maps on the SERVER, populated fresh each page
+                        # load and on Refresh; they are not shipped with the
+                        # dashboard and not read from any developer's checkout.
+                        map_dd = gr.Dropdown(
+                            label="Map (latest explored / saved)",
+                            choices=[], value=None, interactive=True,
+                            elem_classes=["map-selector"])
+                        map_refresh_btn = gr.Button(
+                            "Refresh Maps", variant="secondary",
+                            elem_classes=["goal-refresh-btn"])
                         goal_enable_btn = gr.Button(
                             "Enable Goal Setting", variant="primary",
                             elem_classes=["goal-enable-btn"])
@@ -2400,11 +2413,11 @@ def main():
                                    outputs=[explore_status, explore_log],
                                    api_name="explorer_status")
 
-                def on_goal_enable():
+                def on_goal_enable(map_name):
                     if explorer_control is None:
                         return ("❌ explorer_control is not available, so Goal "
-                                "Setting cannot be enabled.")
-                    return explorer_control.patrol_start()
+                                "Setting cannot be enabled.", "")
+                    return explorer_control.patrol_start(map_name)
 
                 def on_goal_disable():
                     if explorer_control is None:
@@ -2417,14 +2430,51 @@ def main():
                         return ("⚪ Goal Setting is unavailable.")
                     return explorer_control.patrol_status()
 
+                def on_refresh_maps(current):
+                    """Repopulate the map picker from the server.
+
+                    Keeps the current selection if it still exists, otherwise
+                    falls back to the newest map, so a Refresh after a new
+                    exploration does not silently switch the operator onto a
+                    different map than the one they had selected.
+                    """
+                    if explorer_control is None:
+                        return (gr.update(choices=[], value=None),
+                                "❌ explorer_control is not available, so saved "
+                                "maps cannot be listed.")
+                    choices, error = explorer_control.list_maps()
+                    if not choices:
+                        return (gr.update(choices=[], value=None),
+                                f"ℹ️ {error or 'No saved maps found on the server.'}")
+                    values = [value for _, value in choices]
+                    value = current if current in values else values[0]
+                    return (gr.update(choices=choices, value=value),
+                            f"🗺️ {len(choices)} map(s) available. "
+                            "Select one, then Enable Goal Setting.")
+
+                # Endpoint names are exposed to the Gradio API too
+                # (POST /gradio_api/call/enable_goal_setting with
+                # {"data": ["map.yaml"]}), so a map can also be loaded from a
+                # script rather than only by clicking.
                 goal_enable_btn.click(
-                    on_goal_enable, inputs=None,
+                    on_goal_enable, inputs=map_dd,
                     outputs=[goal_status, goal_log],
                     api_name="enable_goal_setting")
                 goal_disable_btn.click(
                     on_goal_disable, inputs=None,
                     outputs=[goal_status, goal_log],
                     api_name="disable_goal_setting")
+                map_refresh_btn.click(
+                    on_refresh_maps, inputs=map_dd,
+                    outputs=[map_dd, goal_status],
+                    api_name="refresh_maps")
+                # Populate the picker once per page load. A failure here only
+                # leaves the picker empty with a message; the rest of the page
+                # (map, camera, explorer) is unaffected.
+                demo.load(
+                    on_refresh_maps, inputs=map_dd,
+                    outputs=[map_dd, goal_status],
+                    api_name="load_maps")
                 goal_timer = gr.Timer(2.0)
                 goal_timer.tick(on_goal_tick,
                                 outputs=[goal_status, goal_log],

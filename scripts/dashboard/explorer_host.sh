@@ -77,16 +77,45 @@ PATROL_LOGFILE=/workspace/patrol_launch.log
 # explorer_robot argument. Only "luna" is meaningful -- Astro has never
 # written a map here.
 PATROL_MAP=/workspace/hardware_code/maps/luna_amcl_completed_map.yaml
+# The directory the explorer writes completed maps into, and the only place the
+# map picker (list-maps / patrol-start <map>) reads from. It is the SAME bind
+# mount as PATROL_MAP above, i.e. it lives on the SERVER inside the container,
+# never in a developer's local checkout -- so the picker always shows the maps
+# the robots actually produced, including the newest one from the latest run.
+MAPS_DIR=/workspace/hardware_code/maps
 
 PHASE="[explorer] PHASE="
 log()  { echo "[explorer] $*"; }
 fail() { echo "[explorer] ERROR: $*" >&2; exit 1; }
 
+# Map a user-supplied map name to an absolute path under $MAPS_DIR, or fail.
+#
+# The request is attacker-influenced (it is whatever the portal asked for), so
+# this is the security boundary for the map picker: only a bare basename ending
+# in .yaml, drawn from a conservative charset and with no path separators or
+# "..", can ever be turned into a path. Existence is checked separately, inside
+# the container, by the caller.
+map_path_for() {
+    local name="$1"
+    case "$name" in
+        *.yaml) ;;
+        *) return 1 ;;
+    esac
+    case "$name" in
+        */*|*..*|.*) return 1 ;;
+    esac
+    case "$name" in
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    printf '%s/%s' "$MAPS_DIR" "$name"
+}
+
 usage() {
     cat >&2 <<EOF
 explorer_host.sh: unsupported request.
   start <luna|astro> | stop | status
-  patrol-start | patrol-stop | patrol-status | patrol-log
+  list-maps
+  patrol-start [<map.yaml>] | patrol-stop | patrol-status | patrol-log
 EOF
     exit 2
 }
@@ -117,12 +146,22 @@ case "$ACTION" in
             *) fail "start needs a robot of exactly 'luna' or 'astro' (got '$ROBOT')" ;;
         esac
         ;;
-    stop|status|log) ;;
+    stop|status|log|list-maps) ;;
     # Localisation server (Goal Setting). No robot argument: one server-side
-    # map_server plus relays republish the completed map to BOTH robots'
+    # map_server plus relays republish the chosen map to BOTH robots'
     # namespaces, so there is nothing to select here. The patrol UI is NOT part
     # of this launch -- see do_patrol_start for why.
-    patrol-start|patrol-stop|patrol-status|patrol-log) ;;
+    #
+    # patrol-start takes an optional map basename. Validated here against the
+    # fixed basename grammar, and its existence is re-checked inside the
+    # container by do_patrol_start: the request is attacker-influenced, so it
+    # must never reach a shell as anything but a checked literal.
+    patrol-start)
+        if [ -n "$ROBOT" ] && ! map_path_for "$ROBOT" >/dev/null 2>&1; then
+            fail "patrol-start map must be a bare *.yaml name under $MAPS_DIR (got '$ROBOT')"
+        fi
+        ;;
+    patrol-stop|patrol-status|patrol-log) ;;
     *) usage ;;
 esac
 
@@ -281,7 +320,36 @@ do_log() {
         || echo "(no launch log yet)"
 }
 
+do_list_maps() {
+    # Every completed map the container can load, as "mtime|name" lines newest
+    # first, for the portal's map picker. Requires the container: the maps sit
+    # on its bind mount, not on the portal, and uniqueness/liveness of that
+    # listing is exactly what the picker needs to offer only loadable maps.
+    if ! container_running; then
+        echo "CONTAINER_DOWN"
+        return 1
+    fi
+    # -printf is GNU find (Debian container). If $MAPS_DIR is empty the command
+    # prints nothing and still exits 0, which the portal reads as "no maps".
+    docker exec "$CONTAINER" bash -c \
+        "find '$MAPS_DIR' -maxdepth 1 -type f -name '*.yaml' \
+         -printf '%T@|%f\n' 2>/dev/null | sort -t'|' -k1,1 -nr"
+}
+
 do_patrol_start() {
+    # Optional first argument: a map basename to localise on. Already checked
+    # against the basename grammar at parse time; existence under $MAPS_DIR is
+    # re-checked inside the container below, so a stale picker entry cannot
+    # launch a map_server that then dies on a missing file.
+    local requested="${1:-}"
+    local map_file="$PATROL_MAP"
+    if [ -n "$requested" ]; then
+        map_file="$(map_path_for "$requested")" || {
+            echo "PATROL_MAP_INVALID"
+            return 2
+        }
+    fi
+
     # Idempotent-ish: refuse rather than stack a second launch, because two
     # would fight over /map and the AMCL filter.
     if patrol_alive; then
@@ -304,7 +372,7 @@ do_patrol_start() {
         source /opt/ros/humble/setup.bash
         [ -f install/setup.bash ] && source install/setup.bash
 
-        if [ ! -f '"$PATROL_MAP"' ]; then
+        if [ ! -f '"$map_file"' ]; then
             echo "PATROL_MAP_MISSING"
             exit 2
         fi
@@ -338,7 +406,7 @@ do_patrol_start() {
         # be able to signal the whole process group.
         setsid ros2 launch go2_hardware_autonomy \
             go2_hivemind_localization_server_launch.py \
-            map_file:='"$PATROL_MAP"' \
+            map_file:='"$map_file"' \
             launch_foxglove_bridge:=false \
             > '"$PATROL_LOGFILE"' 2>&1 < /dev/null &
         echo $! > '"$PATROL_PIDFILE"'
@@ -396,7 +464,8 @@ case "$ACTION" in
     stop)   do_stop ;;
     status) do_status ;;
     log)    do_log ;;
-    patrol-start)  do_patrol_start ;;
+    list-maps)     do_list_maps ;;
+    patrol-start)  do_patrol_start "$ROBOT" ;;
     patrol-stop)   do_patrol_stop ;;
     patrol-status) do_patrol_status ;;
     patrol-log)    do_patrol_log ;;
